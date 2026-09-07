@@ -38,6 +38,9 @@ printf '%s\n' \
   '설치 완료. 다음 명령으로 예시를 확인하세요:' \
   '  source .venv/bin/activate' \
   '  python -m compdesign_bot demo' \
-  '번역 모델을 한 번 설치하세요:' \
+  '.env에 봇 토큰과 번역 방식을 설정하세요. 자세한 내용은 README.md를 참고하세요.' \
+  'Gemini 번역: TRANSLATION_PROVIDER=gemini와 GEMINI_API_KEY를 입력합니다.' \
+  '로컬 번역: TRANSLATION_PROVIDER=local로 두고 모델을 한 번 설치합니다:' \
   '  python -m compdesign_bot setup-translator' \
-  '.env에 텔레그램 봇 토큰을 입력한 뒤 README.md의 연결 절차를 진행하세요.'
+  '설정한 번역기로 실제 피드를 확인합니다. Gemini 모드에서는 API를 호출합니다:' \
+  '  python -m compdesign_bot preview'

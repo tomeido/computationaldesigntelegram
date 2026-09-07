@@ -8,6 +8,7 @@ from .config import Settings
 from .errors import SummaryError
 from .feeds import collect_articles, load_sources
 from .formatting import render_post
+from .gemini_summary import GeminiSummarizer, GeminiUnavailable, cache_namespace
 from .local_summary import CACHE_NAMESPACE, LocalSummarizer
 from .ranking import rank_articles
 from .storage import Store, cache_key, job_lock
@@ -54,15 +55,27 @@ async def run_digest(settings: Settings, *, publish: bool = False, slot: str | N
                 ranked = rank_articles(report.articles, max_age_days=settings.max_age_days)
                 result = RunResult(fetched=len(report.articles), ranked=len(ranked), messages=[])
                 candidates = [item for item in ranked if not store.seen(item.article, channel)]
-                summarizer = LocalSummarizer(model_path=settings.local_model_path)
+                if settings.translation_provider == "gemini":
+                    settings.require_summary()
+                    summarizer = GeminiSummarizer(
+                        client, api_key=settings.gemini_api_key, model=settings.gemini_model
+                    )
+                    namespace = cache_namespace(settings.gemini_model)
+                else:
+                    summarizer = LocalSummarizer(model_path=settings.local_model_path)
+                    namespace = CACHE_NAMESPACE
                 for item in candidates[: settings.max_candidates]:
                     if len(result.messages) >= remaining:
                         break
-                    key = cache_key(item.article, CACHE_NAMESPACE)
+                    key = cache_key(item.article, namespace)
                     found, summary = store.get_summary(key)
                     if not found:
                         try:
                             summary = await summarizer.summarize(item)
+                        except GeminiUnavailable as error:
+                            log.error("%s", error)
+                            result.failed += 1
+                            break
                         except SummaryError as error:
                             log.error("%s", error)
                             result.failed += 1

@@ -100,7 +100,10 @@ async def doctor(settings: Settings):
     else:
         print("채널 미연결: 봇 개인 대화는 이용 가능합니다. 채널 발행에는 관리자 추가가 필요합니다.")
     settings.require_summary()
-    print("로컬 한국어 번역 모델 정상. 외부 AI API를 사용하지 않습니다.")
+    if settings.translation_provider == "gemini":
+        print(f"Gemini 번역 설정 확인: {settings.gemini_model}. 실제 API 연결은 preview로 확인하세요.")
+    else:
+        print("로컬 한국어 번역 모델 정상. 외부 AI API를 사용하지 않습니다.")
 
 
 async def configure_bot(settings: Settings):
@@ -247,7 +250,7 @@ def main():
     sub.add_parser("demo", help="키 없이 발행 형식 예시 보기")
     p = sub.add_parser("collect", help="RSS 수집·순위 확인 (AI 호출·발행 없음)")
     p.add_argument("--json", action="store_true")
-    sub.add_parser("preview", help="로컬 한국어 발췌·번역 미리보기")
+    sub.add_parser("preview", help="선택한 번역기로 한국어 발췌·번역 미리보기")
     sub.add_parser("publish", help="지금 채널에 실제 발행")
     sub.add_parser("run", help="봇 대화 응답 및 연결된 채널에 예약 발행")
     sub.add_parser("listen", help="봇 개인 대화 응답 시작 (채널 없이 가능)")

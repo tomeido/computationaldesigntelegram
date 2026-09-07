@@ -10,7 +10,7 @@
 컴퓨트 디자인 브리핑 | Web3 · AI
 ```
 
-공개 채널 사용자 이름 예시는 `compute_design_kr`입니다. 사용 가능 여부는 텔레그램 앱에서 확인하고, 선택한 실제 사용자 이름을 `.env`의 `TELEGRAM_CHANNEL_ID=@실제사용자이름`으로 입력하세요.
+현재 연결 대상은 [@ComputationalDesignKorea](https://t.me/ComputationalDesignKorea)입니다. 이 채널을 운영한다면 `.env`에 `TELEGRAM_CHANNEL_ID=@ComputationalDesignKorea`를 입력하세요. 다른 채널을 운영한다면 해당 채널의 실제 사용자 이름이나 숫자 ID를 사용하세요.
 
 ## 채널 설명
 
@@ -43,6 +43,8 @@ Web3·블록체인과 컴퓨테이셔널 디자인의 접점을 가장 먼저 �
 ```
 
 운영 시간을 바꿨다면 설명과 고정 게시물도 함께 수정하세요. 봇이 고정 게시물을 자동으로 게시하거나 갱신하지는 않습니다.
+
+번역은 운영자가 `.env`의 `TRANSLATION_PROVIDER`로 선택합니다. `gemini`는 Google AI Studio 키로 제목과 선별한 핵심 문장 최대 2개를 번역하고, `local`은 설치한 모델을 서버에서 실행합니다. 수집·우선순위·발행 시간은 번역 방식과 관계없이 동일합니다. 설정과 무료 등급의 사용 한도는 [설치 안내](../README.md#설치와-번역-방식-선택)를 참고하세요.
 
 ## 대화할 수 있는 정보방 연결
 

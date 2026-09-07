@@ -6,6 +6,8 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from dotenv import load_dotenv
 
+from .gemini_summary import DEFAULT_GEMINI_MODEL, GeminiUnavailable, validate_model
+
 
 def _integer(name: str, default: int, low: int, high: int) -> int:
     try:
@@ -21,6 +23,9 @@ def _integer(name: str, default: int, low: int, high: int) -> int:
 class Settings:
     bot_token: str = field(default="", repr=False)
     channel_id: str = ""
+    translation_provider: str = "local"
+    gemini_api_key: str = field(default="", repr=False)
+    gemini_model: str = DEFAULT_GEMINI_MODEL
     local_model_path: Path = Path("data/models/m2m100")
     channel_name: str = "컴퓨트 디자인 브리핑 | Web3 · AI"
     timezone: str = "Asia/Seoul"
@@ -30,6 +35,14 @@ class Settings:
     max_candidates: int = 15
     sources_file: Path = Path("config/sources.json")
     database_path: Path = Path("data/bot.sqlite3")
+
+    def __post_init__(self) -> None:
+        if self.translation_provider not in {"local", "gemini"}:
+            raise ValueError("TRANSLATION_PROVIDER: local 또는 gemini를 입력하세요.")
+        try:
+            validate_model(self.gemini_model)
+        except GeminiUnavailable:
+            raise ValueError("GEMINI_MODEL: 유효한 Gemini 모델 ID를 입력하세요.") from None
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -52,6 +65,9 @@ class Settings:
         return cls(
             bot_token=os.getenv("TELEGRAM_BOT_TOKEN", "").strip(),
             channel_id=os.getenv("TELEGRAM_CHANNEL_ID", "").strip(),
+            translation_provider=os.getenv("TRANSLATION_PROVIDER", "local").strip().lower(),
+            gemini_api_key=os.getenv("GEMINI_API_KEY", "").strip(),
+            gemini_model=os.getenv("GEMINI_MODEL", cls.gemini_model).strip(),
             local_model_path=Path(os.getenv("LOCAL_MODEL_PATH", "data/models/m2m100")),
             channel_name=os.getenv("CHANNEL_NAME", cls.channel_name).strip()[:100],
             timezone=timezone,
@@ -64,6 +80,10 @@ class Settings:
         )
 
     def require_summary(self) -> None:
+        if self.translation_provider == "gemini":
+            if not self.gemini_api_key:
+                raise ValueError(".env에 GEMINI_API_KEY를 입력하세요.")
+            return
         from .local_summary import check_model
 
         check_model(self.local_model_path)
