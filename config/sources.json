@@ -1,0 +1,55 @@
+{
+  "sources": [
+    {
+      "name": "Le Random · 생성예술 인터뷰",
+      "url": "https://www.lerandom.art/editorial/rss.xml",
+      "topic": "web3_design"
+    },
+    {
+      "name": "Right Click Save · 디지털 아트",
+      "url": "https://www.rightclicksave.com/article/rss.xml",
+      "topic": "web3_design"
+    },
+    {
+      "name": "Tezos Spotlight",
+      "url": "https://spotlight.tezos.com/feed.xml",
+      "topic": "web3_design"
+    },
+    {
+      "name": "Art Blocks · Google News 검색 발견 (제목만)",
+      "url": "https://news.google.com/rss/search?q=site%3Aartblocks.io+%28generative+OR+algorithm+OR+art%29+when%3A60d&hl=en-US&gl=US&ceid=US%3Aen",
+      "topic": "web3_design",
+      "discovery": true
+    },
+    {
+      "name": "Rhino 새소식 · 한국어",
+      "url": "https://blog.kr.rhino3d.com/feeds/posts/default?alt=rss",
+      "topic": "computational_design"
+    },
+    {
+      "name": "Rhino News · Grasshopper",
+      "url": "https://blog.rhino3d.com/feeds/posts/default?alt=rss",
+      "topic": "computational_design"
+    },
+    {
+      "name": "Blender Developers",
+      "url": "https://code.blender.org/feed/",
+      "topic": "computational_design"
+    },
+    {
+      "name": "Processing Foundation",
+      "url": "https://medium.com/feed/processing-foundation",
+      "topic": "computational_design"
+    },
+    {
+      "name": "CDFAM · AI와 컴퓨테이셔널 설계",
+      "url": "https://cdfam.com/feed/",
+      "topic": "ai_design"
+    },
+    {
+      "name": "Hugging Face Blog",
+      "url": "https://huggingface.co/blog/feed.xml",
+      "topic": "ai_design"
+    }
+  ]
+}

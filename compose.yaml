@@ -1,0 +1,12 @@
+services:
+  bot:
+    build: .
+    env_file: .env
+    volumes:
+      - ./config:/app/config:ro
+      - bot-data:/app/data
+    restart: unless-stopped
+    init: true
+
+volumes:
+  bot-data:

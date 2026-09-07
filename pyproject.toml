@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "compdesign-telegram"
+version = "0.1.0"
+description = "Web3·AI 컴퓨테이셔널 디자인 한국어 텔레그램 브리핑"
+requires-python = ">=3.11"
+dependencies = ["httpx>=0.28,<0.29", "feedparser>=6.0,<7", "python-dotenv>=1.0,<2"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8,<10", "ruff>=0.12,<1"]
+
+[project.scripts]
+compdesign = "compdesign_bot.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["compdesign_bot*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 110
