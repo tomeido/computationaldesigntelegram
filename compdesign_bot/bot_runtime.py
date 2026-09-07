@@ -56,7 +56,13 @@ def read_listener_state(database_path: Path) -> dict:
             raise ValueError
         if any(not isinstance(row, dict) or type(row.get("id")) is not int for row in channels):
             raise ValueError
-        return {"offset": offset, "channels": channels}
+        result = {"offset": offset, "channels": channels}
+        if "bot_id" in state:
+            bot_id = state["bot_id"]
+            if type(bot_id) is not int or bot_id <= 0:
+                raise ValueError
+            result["bot_id"] = bot_id
+        return result
     except (ValueError, TypeError, UnicodeError):
         # Resetting corrupt offsets would replay old commands and could duplicate replies.
         raise RuntimeError("봇 수신 상태 파일을 읽을 수 없습니다. 파일을 확인하세요.") from None
@@ -267,8 +273,18 @@ async def listen(settings: Settings) -> None:
             if not isinstance(webhook, dict) or webhook.get("url"):
                 raise RuntimeError("웹훅이 연결되어 있어 수신기를 시작할 수 없습니다. 기존 웹훅 설정을 확인하세요.")
             me = await telegram.call("getMe")
-            if not isinstance(me, dict) or not isinstance(me.get("username"), str):
-                raise RuntimeError("봇 계정을 확인할 수 없습니다.")  # noqa: TRY004 - invalid API response
+            if (
+                not isinstance(me, dict)
+                or not isinstance(me.get("username"), str)
+                or type(me.get("id")) is not int
+                or me["id"] <= 0
+            ):
+                raise RuntimeError("봇 계정을 확인할 수 없습니다.")
+            if state.get("bot_id") != me["id"]:
+                # Telegram update IDs belong to one bot; another account's cursor
+                # can discard this bot's pending updates. Leave delivery history alone.
+                state = {"bot_id": me["id"], "offset": 0, "channels": []}
+                write_listener_state(settings.database_path, state)
             handler = CommandHandler(settings, telegram, me["username"])
             delay = 1
             log.info("개인 명령 수신기를 시작했습니다.")

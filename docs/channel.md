@@ -2,7 +2,7 @@
 
 봇은 사용자가 만든 텔레그램 채널에 게시합니다. 채널 생성은 텔레그램 앱에서 진행해야 합니다. Telegram의 채널 생성 API는 사용자 계정만 사용할 수 있습니다. [공식 문서](https://core.telegram.org/method/channels.createChannel)
 
-이 프로젝트에서 연결할 봇은 [@ComputataionalDesignBot](https://t.me/ComputataionalDesignBot)입니다. 채널을 만든 뒤 이 봇을 관리자로 추가하고 **메시지 게시** 권한을 부여하세요. 채널 연결 전에도 실행 중인 봇과 개인 대화에서 `/latest`로 브리핑을 요청할 수 있습니다.
+이 프로젝트에서 연결할 봇은 [@ComputationalDesign_bot](https://t.me/ComputationalDesign_bot)입니다. [채널에 봇 추가하기](https://t.me/ComputationalDesign_bot?startchannel&admin=post_messages)를 열어 대상 채널을 선택하고 **메시지 게시** 권한을 부여하세요. 이 링크는 Telegram의 [공식 채널 관리자 추가 방식](https://core.telegram.org/api/links#group-channel-bot-links)을 사용합니다. 채널 연결 전에도 실행 중인 봇과 개인 대화에서 `/latest`로 브리핑을 요청할 수 있습니다.
 
 ## 채널 이름
 

@@ -2,7 +2,7 @@
 
 **텔레그램 봇 토큰만으로 운영하는 한국어 컴퓨테이셔널 디자인 정보봇**입니다. Web3·블록체인과 디자인이 겹치는 소식을 우선 수집하고, AI 디자인·온체인 생성예술·크리에이티브 코딩 소식을 짧게 전합니다. 별도 AI API 키나 번역 API 키가 필요하지 않습니다.
 
-연결할 봇: **[@ComputataionalDesignBot](https://t.me/ComputataionalDesignBot)**. 실행 중인 봇과 개인 대화에서 `/start`를 누르거나 `/latest`로 브리핑을 요청할 수 있습니다. 채널을 연결하면 **한국시간 오전 9시·오후 6시**, 회당 최대 5건을 자동 게시합니다.
+연결할 봇: **[@ComputationalDesign_bot](https://t.me/ComputationalDesign_bot)**. 실행 중인 봇과 개인 대화에서 `/start`를 누르거나 `/latest`로 브리핑을 요청할 수 있습니다. 채널을 연결하면 **한국시간 오전 9시·오후 6시**, 회당 최대 5건을 자동 게시합니다.
 
 ## 설치와 로컬 미리보기
 
@@ -40,6 +40,8 @@ TELEGRAM_CHANNEL_ID=
 
 `.env` 권한은 설치 스크립트에서 `600`으로 설정합니다. 수동으로 만들었다면 `chmod 600 .env`를 실행하세요.
 
+다른 봇의 토큰으로 교체했다면 실행 중인 봇을 재시작하세요. 새 계정에 맞춰 메시지 수신 위치를 초기화하며, 기존 채널 발행 기록과 번역 모델은 유지합니다. 같은 봇의 토큰을 재발급받은 경우에는 수신 위치도 유지됩니다.
+
 ```bash
 # 설정, 로컬 번역 모델, Telegram 연결 확인
 python -m compdesign_bot doctor
@@ -65,7 +67,7 @@ python -m compdesign_bot run
 ## 자동 게시 채널 연결
 
 1. 텔레그램 앱에서 새 채널을 만듭니다. 이름·설명·고정 게시물 문구는 [채널 운영 안내](docs/channel.md)에 준비되어 있습니다. 채널 생성 API는 사용자 계정 전용이므로 봇 토큰으로 채널을 만들 수는 없습니다. [공식 문서](https://core.telegram.org/method/channels.createChannel)
-2. 채널 관리자로 [@ComputataionalDesignBot](https://t.me/ComputataionalDesignBot)을 추가하고 **메시지 게시 / Post Messages** 권한을 부여합니다. 다른 봇 토큰을 사용했다면 해당 봇을 추가하세요.
+2. [채널에 봇 추가하기](https://t.me/ComputationalDesign_bot?startchannel&admin=post_messages)를 열어 대상 채널을 선택하고 **메시지 게시 / Post Messages** 권한을 부여합니다. 직접 추가하려면 채널의 **관리자 → 관리자 추가**에서 `@ComputationalDesign_bot`을 검색하세요. 다른 봇 토큰을 사용했다면 해당 봇을 추가하세요.
 3. 공개 채널은 실제 사용자 이름을 `.env`에 입력합니다. `t.me/compute_design_kr`라면 `TELEGRAM_CHANNEL_ID=@compute_design_kr`입니다. 예시 이름의 사용 가능 여부는 앱에서 확인하세요.
 4. 비공개 채널이라면 봇 추가 후 채널에 짧은 글을 직접 게시하고 아래 명령에서 채널 ID를 확인합니다.
 

@@ -167,6 +167,7 @@ def test_only_valid_public_channel_names_become_links():
 def test_atomic_offset_persistence_preserves_passive_channels_and_no_message_text(tmp_path):
     path = tmp_path / "data" / "bot.sqlite3"
     state = read_listener_state(path)
+    state["bot_id"] = 123
     remember_channel(state, {
         "channel_post": {
             "chat": {"id": -1001, "type": "channel", "title": "정보방", "username": "our_channel"},
@@ -176,6 +177,7 @@ def test_atomic_offset_persistence_preserves_passive_channels_and_no_message_tex
     write_listener_state(path, state)
     write_offset(path, 11)
     assert read_offset(path) == 11
+    assert read_listener_state(path)["bot_id"] == 123
     assert read_listener_state(path)["channels"] == [
         {"id": -1001, "type": "channel", "title": "정보방", "username": "our_channel"}
     ]
@@ -189,6 +191,104 @@ def test_corrupt_offset_does_not_silently_replay_commands(tmp_path):
     offset_path(path).write_text('{"offset": -1}')
     with pytest.raises(RuntimeError, match="수신 상태"):
         read_offset(path)
+
+
+@pytest.mark.parametrize("bot_id", [None, True, False, 0, -1, "123", 1.5, []])
+def test_malformed_persisted_bot_identity_fails_closed(tmp_path, bot_id):
+    path = tmp_path / "bot.sqlite3"
+    write_listener_state(path, {"bot_id": bot_id, "offset": 999999, "channels": []})
+    with pytest.raises(RuntimeError, match="수신 상태"):
+        read_listener_state(path)
+
+
+def test_same_bot_restart_preserves_cursor_and_channels(monkeypatch, tmp_path):
+    path = tmp_path / "bot.sqlite3"
+    original = {"bot_id": 123, "offset": 999999, "channels": [{"id": -1001, "type": "channel"}]}
+    write_listener_state(path, original)
+    polls = []
+
+    class PollingTelegram:
+        def __init__(self, *args):
+            pass
+
+        async def call(self, method, **payload):
+            if method == "getWebhookInfo":
+                return {"url": ""}
+            if method == "getMe":
+                return {"id": 123, "username": "renamed_bot"}
+            assert method == "getUpdates"
+            polls.append(payload["offset"])
+            assert read_listener_state(path) == original
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(bot_runtime, "Telegram", PollingTelegram)
+    for _ in range(2):
+        with pytest.raises(asyncio.CancelledError):
+            asyncio.run(bot_runtime.listen(Settings(bot_token="SECRET", database_path=path)))
+    assert polls == [999999, 999999]
+    assert read_listener_state(path) == original
+
+
+@pytest.mark.parametrize("previous_bot_id", [None, 456], ids=["legacy_unknown_bot", "different_bot"])
+def test_account_binding_resets_stale_cursor_and_processes_new_low_update(monkeypatch, tmp_path, previous_bot_id):
+    path = tmp_path / "bot.sqlite3"
+    path.write_bytes(b"existing delivery ledger")
+    original = {"offset": 999999, "channels": [{"id": -1001, "type": "channel"}]}
+    if previous_bot_id is not None:
+        original["bot_id"] = previous_bot_id
+    write_listener_state(path, original)
+    polls = []
+    replies = []
+
+    class PollingTelegram:
+        def __init__(self, *args):
+            pass
+
+        async def call(self, method, **payload):
+            if method == "getWebhookInfo":
+                return {"url": ""}
+            if method == "getMe":
+                assert read_listener_state(path) == original
+                return {"id": 123, "username": "our_bot"}
+            if method == "sendMessage":
+                replies.append(payload["chat_id"])
+                return {"message_id": 1}
+            assert method == "getUpdates"
+            polls.append(payload["offset"])
+            if len(polls) == 1:
+                assert read_listener_state(path) == {"bot_id": 123, "offset": 0, "channels": []}
+                return [command("/start")]
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(bot_runtime, "Telegram", PollingTelegram)
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(bot_runtime.listen(Settings(bot_token="SECRET", database_path=path)))
+    assert polls == [0, 11]
+    assert replies == [42]
+    assert read_listener_state(path) == {"bot_id": 123, "offset": 11, "channels": []}
+    assert path.read_bytes() == b"existing delivery ledger"
+
+
+@pytest.mark.parametrize("bot_id", [None, True, 0, -1, "123"])
+def test_unverified_bot_identity_never_rebinds_state_or_polls(monkeypatch, tmp_path, bot_id):
+    path = tmp_path / "bot.sqlite3"
+    original = {"bot_id": 456, "offset": 999999, "channels": [{"id": -1001}]}
+    write_listener_state(path, original)
+
+    class InvalidIdentityTelegram:
+        def __init__(self, *args):
+            pass
+
+        async def call(self, method, **payload):
+            if method == "getWebhookInfo":
+                return {"url": ""}
+            assert method == "getMe"
+            return {"id": bot_id, "username": "our_bot"}
+
+    monkeypatch.setattr(bot_runtime, "Telegram", InvalidIdentityTelegram)
+    with pytest.raises(RuntimeError, match="봇 계정"):
+        asyncio.run(bot_runtime.listen(Settings(bot_token="SECRET", database_path=path)))
+    assert read_listener_state(path) == original
 
 
 def test_listener_lock_is_exclusive_and_separate_from_job_lock(tmp_path):
@@ -231,7 +331,7 @@ def test_listener_advances_offsets_after_handling_and_keeps_channel_updates(monk
             if method == "getWebhookInfo":
                 return {"url": ""}
             if method == "getMe":
-                return {"username": "our_bot"}
+                return {"id": 123, "username": "our_bot"}
             if method == "sendMessage":
                 assert read_offset(path) == 0
                 raise DeliveryUncertain("Response was lost")
@@ -267,7 +367,7 @@ def test_cancellation_during_handler_does_not_advance_offset(monkeypatch, tmp_pa
             if method == "getWebhookInfo":
                 return {"url": ""}
             if method == "getMe":
-                return {"username": "our_bot"}
+                return {"id": 123, "username": "our_bot"}
             if method == "getUpdates":
                 return [command("/start")]
             if method == "sendMessage":
@@ -295,7 +395,7 @@ def test_polling_transient_errors_retry_with_bounded_delays(monkeypatch, tmp_pat
             if method == "getWebhookInfo":
                 return {"url": ""}
             if method == "getMe":
-                return {"username": "our_bot"}
+                return {"id": 123, "username": "our_bot"}
             raise DeliveryUncertain("SECRET must not appear in logs")
 
     monkeypatch.setattr(bot_runtime, "Telegram", PollingTelegram)
