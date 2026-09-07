@@ -7,6 +7,8 @@ services:
       - bot-data:/app/data
     restart: unless-stopped
     init: true
+    mem_limit: 1536m
+    cpus: 2.0
 
 volumes:
   bot-data:

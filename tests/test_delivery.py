@@ -9,7 +9,7 @@ import pytest
 
 from compdesign_bot import pipeline
 from compdesign_bot.config import Settings
-from compdesign_bot.models import Article
+from compdesign_bot.models import Article, Summary
 from compdesign_bot.storage import Store
 from compdesign_bot.telegram import DeliveryUncertain, Telegram, TelegramError
 
@@ -136,24 +136,20 @@ def configure_pipeline(monkeypatch, tmp_path, send_handler, *, max_posts=5):
             return httpx.Response(200, json={"ok": True, "result": results[method]})
         if method == "sendMessage":
             return send_handler(request, payload)
-        assert request.url.host == "api.openai.com"
-        article = json.loads(payload["input"])
-        index = article["title"].rsplit(" ", 1)[-1]
-        summary = {
-            "relevant": True,
-            "title": f"생성 예술 연구 {index}",
-            "bullets": ["디자인 도구를 공개했습니다."],
-            "why": "코딩으로 작품을 구현합니다.",
-        }
-        return httpx.Response(
-            200,
-            json={
-                "status": "completed",
-                "output": [
-                    {"type": "message", "content": [{"type": "output_text", "text": json.dumps(summary)}]}
-                ],
-            },
-        )
+        raise AssertionError(f"Unexpected external service: {request.url.host}")
+
+    class LocalSummary:
+        def __init__(self, **kwargs):
+            pass
+
+        async def summarize(self, item):
+            index = item.article.title.rsplit(" ", 1)[-1]
+            return Summary(
+                f"생성 예술 연구 {index}",
+                ("디자인 도구를 공개했습니다.",),
+                "코딩으로 작품을 구현합니다.",
+                "발췌·기계번역",
+            )
 
     async def collect(_sources, _client):
         return SimpleNamespace(articles=[make_article(index) for index in range(1, 4)], errors=[])
@@ -165,11 +161,11 @@ def configure_pipeline(monkeypatch, tmp_path, send_handler, *, max_posts=5):
     )
     monkeypatch.setattr(pipeline, "collect_articles", collect)
     monkeypatch.setattr(pipeline, "load_sources", lambda _path: [])
+    monkeypatch.setattr(pipeline, "LocalSummarizer", LocalSummary)
     monkeypatch.setattr(asyncio, "sleep", no_sleep)
     return Settings(
         bot_token="SECRET",
         channel_id="@test",
-        openai_api_key="SECRET",
         database_path=tmp_path / "pipeline.sqlite3",
         max_posts=max_posts,
     )

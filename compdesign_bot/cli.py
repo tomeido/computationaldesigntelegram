@@ -83,39 +83,83 @@ async def collect(settings: Settings, as_json: bool):
 
 
 async def doctor(settings: Settings):
-    missing = [
-        name
-        for name, value in [
-            ("TELEGRAM_BOT_TOKEN", settings.bot_token),
-            ("TELEGRAM_CHANNEL_ID", settings.channel_id),
-            ("OPENAI_API_KEY", settings.openai_api_key),
-        ]
-        if not value
-    ]
+    settings.require_token()
     sources = load_sources(settings.sources_file)
     print(f"활성 소스: {sum(s.enabled for s in sources)}개")
     print(f"예약: {', '.join(t.strftime('%H:%M') for t in settings.post_times)} ({settings.timezone})")
-    if settings.bot_token and settings.channel_id:
-        async with httpx.AsyncClient() as client:
-            access = await Telegram(client, settings.bot_token, settings.channel_id).check_access()
+    async with httpx.AsyncClient() as client:
+        bot = Telegram(client, settings.bot_token, settings.channel_id)
+        me = await bot.call("getMe")
+        print(f"봇 연결 정상: @{me['username']}")
+        if settings.channel_id:
+            access = await bot.check_access()
+        else:
+            access = None
+    if access:
         print(f"텔레그램 연결 정상: @{access['bot']} → {access['channel']} ({access['id']})")
-    if missing:
-        raise ValueError(".env에서 설정이 필요합니다: " + ", ".join(missing))
-    print("설정 확인 완료. OpenAI 키의 실제 동작은 preview로 확인하세요 (API 사용료 발생).")
+    else:
+        print("채널 미연결: 봇 개인 대화는 이용 가능합니다. 채널 발행에는 관리자 추가가 필요합니다.")
+    settings.require_summary()
+    print("로컬 한국어 번역 모델 정상. 외부 AI API를 사용하지 않습니다.")
+
+
+async def configure_bot(settings: Settings):
+    settings.require_token()
+    description = (
+        "Web3·블록체인과 컴퓨테이셔널 디자인의 접점을 먼저 전합니다. "
+        "온체인 생성 예술, AI 디자인 도구, 파라메트릭 디자인, 크리에이티브 코딩 소식을 "
+        "한국어 발췌·번역과 원문 링크로 확인하세요.\n\n"
+        "/latest 최신 브리핑\n/sources 정보 출처\n/help 이용 안내"
+    )
+    commands = [
+        {"command": command, "description": text}
+        for command, text in (
+            ("start", "컴퓨트 디자인 브리핑 시작"),
+            ("latest", "최신 한국어 디자인 브리핑"),
+            ("sources", "정보 출처 확인"),
+            ("help", "이용 안내와 채널 연결 방법"),
+        )
+    ]
+    async with httpx.AsyncClient() as client:
+        bot = Telegram(client, settings.bot_token, settings.channel_id)
+        me = await bot.call("getMe")
+        for language in ("", "ko"):
+            await bot.call("setMyName", name="컴퓨트 디자인 브리핑 | Web3 · AI", language_code=language)
+            await bot.call("setMyDescription", description=description, language_code=language)
+            await bot.call(
+                "setMyShortDescription",
+                short_description="Web3·AI·컴퓨테이셔널 디자인의 핵심을 한국어로. 생성 예술·크리에이티브 코딩 소식과 원문 링크.",
+                language_code=language,
+            )
+            await bot.call(
+                "setMyCommands",
+                commands=commands,
+                language_code=language,
+                scope={"type": "all_private_chats"},
+            )
+    print(f"봇 이름·소개·명령 설정 완료: https://t.me/{me['username']}")
 
 
 async def discover_channel(settings: Settings):
+    from .bot_runtime import listener_lock, read_listener_state
+
     if not settings.bot_token:
         raise ValueError(".env에 TELEGRAM_BOT_TOKEN을 먼저 입력하세요.")
-    async with httpx.AsyncClient() as client:
-        bot = Telegram(client, settings.bot_token, "")
-        info = await bot.call("getWebhookInfo")
-        if info.get("url"):
-            raise ValueError(
-                "이 봇에는 웹훅이 설정되어 있습니다. 새 전용 봇을 사용하거나 기존 운영 설정을 확인하세요."
-            )
-        updates = await bot.call("getUpdates", timeout=0)
-    channels = {}
+    known = read_listener_state(settings.database_path).get("channels", [])
+    channels = {chat["id"]: chat.get("title", "") for chat in known}
+    if channels:
+        for channel_id, title in channels.items():
+            print(f"{title}: TELEGRAM_CHANNEL_ID={channel_id}")
+        return
+    with listener_lock(settings.database_path):
+        async with httpx.AsyncClient() as client:
+            bot = Telegram(client, settings.bot_token, "")
+            info = await bot.call("getWebhookInfo")
+            if info.get("url"):
+                raise ValueError(
+                    "이 봇에는 웹훅이 설정되어 있습니다. 새 전용 봇을 사용하거나 기존 운영 설정을 확인하세요."
+                )
+            updates = await bot.call("getUpdates", timeout=0)
     for update in updates:
         event = update.get("channel_post") or update.get("my_chat_member") or {}
         chat = event.get("chat", {})
@@ -134,6 +178,13 @@ async def dispatch(args, settings: Settings):
         await doctor(settings)
     elif args.command == "discover-channel":
         await discover_channel(settings)
+    elif args.command == "configure-bot":
+        await configure_bot(settings)
+    elif args.command == "setup-translator":
+        from .local_summary import setup_model
+
+        await asyncio.to_thread(setup_model, settings.local_model_path)
+        print("로컬 영어→한국어 번역 모델 설치 완료. 외부 AI API 키가 필요하지 않습니다.")
     elif args.command == "configure-channel":
         settings.require_telegram()
         async with httpx.AsyncClient() as client:
@@ -142,8 +193,15 @@ async def dispatch(args, settings: Settings):
             await bot.call("setChatTitle", chat_id=settings.channel_id, title=settings.channel_name)
             await bot.call("setChatDescription", chat_id=settings.channel_id, description=CHANNEL_DESCRIPTION)
         print(f"채널 이름·소개 설정 완료: {settings.channel_name}")
-    elif args.command == "run":
-        await serve(settings)
+    elif args.command in ("run", "listen"):
+        from .bot_runtime import listen
+
+        settings.require_token()
+        if args.command == "run" and settings.channel_id:
+            await asyncio.gather(listen(settings), serve(settings))
+        else:
+            print("봇 개인 대화 응답을 시작합니다. 채널 발행은 채널 연결 후 활성화됩니다.", flush=True)
+            await listen(settings)
     elif args.command in ("preview", "publish"):
         result = await run_digest(settings, publish=args.command == "publish")
         if args.command == "preview":
@@ -189,9 +247,12 @@ def main():
     sub.add_parser("demo", help="키 없이 발행 형식 예시 보기")
     p = sub.add_parser("collect", help="RSS 수집·순위 확인 (AI 호출·발행 없음)")
     p.add_argument("--json", action="store_true")
-    sub.add_parser("preview", help="한국어 요약 미리보기 (OpenAI 사용료 발생)")
+    sub.add_parser("preview", help="로컬 한국어 발췌·번역 미리보기")
     sub.add_parser("publish", help="지금 채널에 실제 발행")
-    sub.add_parser("run", help="예약 시간에 자동 발행")
+    sub.add_parser("run", help="봇 대화 응답 및 연결된 채널에 예약 발행")
+    sub.add_parser("listen", help="봇 개인 대화 응답 시작 (채널 없이 가능)")
+    sub.add_parser("setup-translator", help="무료 로컬 한국어 번역 모델 설치")
+    sub.add_parser("configure-bot", help="봇 이름·소개·명령 설정")
     sub.add_parser("doctor", help="설정·텔레그램 권한 확인")
     sub.add_parser("discover-channel", help="봇이 추가된 채널 ID 확인")
     sub.add_parser("configure-channel", help="기존 채널 이름·소개 변경")

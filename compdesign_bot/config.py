@@ -21,8 +21,7 @@ def _integer(name: str, default: int, low: int, high: int) -> int:
 class Settings:
     bot_token: str = field(default="", repr=False)
     channel_id: str = ""
-    openai_api_key: str = field(default="", repr=False)
-    openai_model: str = "gpt-4.1-mini"
+    local_model_path: Path = Path("data/models/m2m100")
     channel_name: str = "컴퓨트 디자인 브리핑 | Web3 · AI"
     timezone: str = "Asia/Seoul"
     post_times: tuple[time, ...] = (time(9), time(18))
@@ -53,8 +52,7 @@ class Settings:
         return cls(
             bot_token=os.getenv("TELEGRAM_BOT_TOKEN", "").strip(),
             channel_id=os.getenv("TELEGRAM_CHANNEL_ID", "").strip(),
-            openai_api_key=os.getenv("OPENAI_API_KEY", "").strip(),
-            openai_model=os.getenv("OPENAI_MODEL", "gpt-4.1-mini").strip(),
+            local_model_path=Path(os.getenv("LOCAL_MODEL_PATH", "data/models/m2m100")),
             channel_name=os.getenv("CHANNEL_NAME", cls.channel_name).strip()[:100],
             timezone=timezone,
             post_times=times,
@@ -66,10 +64,13 @@ class Settings:
         )
 
     def require_summary(self) -> None:
-        if not self.openai_api_key:
-            raise ValueError(
-                ".env에 OPENAI_API_KEY를 입력하세요. 키 없이 확인하려면 demo 또는 collect를 실행하세요."
-            )
+        from .local_summary import check_model
+
+        check_model(self.local_model_path)
+
+    def require_token(self) -> None:
+        if not self.bot_token:
+            raise ValueError(".env에 TELEGRAM_BOT_TOKEN을 입력하세요.")
 
     def require_telegram(self) -> None:
         if not self.bot_token or not self.channel_id:

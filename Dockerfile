@@ -7,7 +7,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /app
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends tzdata \
+    && apt-get install -y --no-install-recommends tzdata libgomp1 \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.lock ./
@@ -15,7 +15,7 @@ RUN python -m pip install -r requirements.lock
 
 COPY pyproject.toml ./
 COPY compdesign_bot ./compdesign_bot
-RUN python -m pip install --no-deps .
+RUN python -m pip install --no-deps '.[local]'
 
 COPY config ./config
 RUN mkdir -p /app/data

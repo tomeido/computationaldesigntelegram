@@ -6,10 +6,11 @@ build-backend = "setuptools.build_meta"
 name = "compdesign-telegram"
 version = "0.1.0"
 description = "Web3·AI 컴퓨테이셔널 디자인 한국어 텔레그램 브리핑"
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 dependencies = ["httpx>=0.28,<0.29", "feedparser>=6.0,<7", "python-dotenv>=1.0,<2"]
 
 [project.optional-dependencies]
+local = ["ctranslate2>=4.6,<5", "sentencepiece>=0.2,<0.3"]
 dev = ["pytest>=8,<10", "ruff>=0.12,<1"]
 
 [project.scripts]

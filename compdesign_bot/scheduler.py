@@ -29,7 +29,6 @@ def next_run(now: datetime, settings: Settings) -> datetime:
 
 
 async def serve(settings: Settings):
-    settings.require_summary()
     settings.require_telegram()
     log.info("자동 발행 시작. 다음 예약: %s", next_run(datetime.now().astimezone(), settings).isoformat())
     attempted_slot = None

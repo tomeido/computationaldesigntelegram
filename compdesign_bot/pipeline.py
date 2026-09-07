@@ -5,11 +5,12 @@ from dataclasses import dataclass
 import httpx
 
 from .config import Settings
+from .errors import SummaryError
 from .feeds import collect_articles, load_sources
 from .formatting import render_post
+from .local_summary import CACHE_NAMESPACE, LocalSummarizer
 from .ranking import rank_articles
 from .storage import Store, cache_key, job_lock
-from .summarizer import Summarizer, SummaryError
 from .telegram import DeliveryUncertain, Telegram, TelegramError
 
 log = logging.getLogger(__name__)
@@ -25,7 +26,6 @@ class RunResult:
 
 
 async def run_digest(settings: Settings, *, publish: bool = False, slot: str | None = None) -> RunResult:
-    settings.require_summary()
     if publish:
         settings.require_telegram()
     with job_lock(settings.database_path):
@@ -54,11 +54,11 @@ async def run_digest(settings: Settings, *, publish: bool = False, slot: str | N
                 ranked = rank_articles(report.articles, max_age_days=settings.max_age_days)
                 result = RunResult(fetched=len(report.articles), ranked=len(ranked), messages=[])
                 candidates = [item for item in ranked if not store.seen(item.article, channel)]
-                summarizer = Summarizer(client, settings.openai_api_key, settings.openai_model)
+                summarizer = LocalSummarizer(model_path=settings.local_model_path)
                 for item in candidates[: settings.max_candidates]:
                     if len(result.messages) >= remaining:
                         break
-                    key = cache_key(item.article, settings.openai_model)
+                    key = cache_key(item.article, CACHE_NAMESPACE)
                     found, summary = store.get_summary(key)
                     if not found:
                         try:
