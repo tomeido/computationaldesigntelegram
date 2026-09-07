@@ -1,3 +1,4 @@
+from dataclasses import replace
 from datetime import UTC, datetime
 from html.parser import HTMLParser
 
@@ -46,3 +47,25 @@ def test_telegram_html_escapes_all_article_and_summary_content():
 def test_unsafe_article_links_are_rejected(url):
     with pytest.raises(ValueError):
         render_post(item(url=url), Summary("제목", ("핵심",), "의미", "근거"))
+
+
+@pytest.mark.parametrize(
+    "kind,label,tag", [("paper", "논문", "#논문"), ("funding", "투자·지원", "#투자지원"),
+                       ("showcase", "작품·실험", "#작품실험")]
+)
+def test_content_kind_is_visible_without_replacing_topic(kind, label, tag):
+    ranked = item()
+    ranked = replace(ranked, article=replace(ranked.article, kind=kind))
+    post = render_post(ranked, Summary("제목", ("핵심",), "의미", "근거"))
+    assert f"{label} · Web3 × 디자인" in post
+    assert tag in post
+
+
+def test_arxiv_label_does_not_infer_peer_review_status():
+    ranked = item(url="https://arxiv.org/abs/2604.24648")
+    ranked = replace(ranked, article=replace(ranked.article, kind="paper"))
+    post = render_post(ranked, Summary("제목", ("핵심",), "의미", "근거"))
+    assert "arXiv 수록본" in post
+    assert "게재 여부" in post
+    assert "미심사" not in post
+    assert "심사 완료" not in post

@@ -16,6 +16,7 @@ from compdesign_bot.local_summary import (
     LocalSummarizer,
     OfflineTranslator,
     _download_model,
+    _terms_in_korean,
     check_model,
     extract_sentences,
     setup_model,
@@ -24,9 +25,9 @@ from compdesign_bot.local_summary import (
 from compdesign_bot.models import Article, RankedArticle
 
 
-def item(title="Computational design research", excerpt=""):
+def item(title="Computational design research", excerpt="", *, kind="news"):
     return RankedArticle(
-        Article(title, "https://example.com/research", "Research", excerpt, datetime.now(UTC)),
+        Article(title, "https://example.com/research", "Research", excerpt, datetime.now(UTC), kind=kind),
         1,
         10,
         "Web3 × 디자인",
@@ -264,3 +265,115 @@ def test_extraction_skips_malformed_schedule_tables_and_tool_lists():
     assert extract_sentences("Courses", excerpt) == [
         "These courses teach computational design using practical projects."
     ]
+
+
+def test_paper_extraction_pairs_method_with_results_instead_of_generic_introduction():
+    introduction = (
+        "Computational design and generative geometry research use algorithms and machine learning."
+    )
+    method = "We propose a differentiable renderer for optimizing parametric surfaces."
+    elaboration = "We introduce a new algorithm for computational geometry and generative design."
+    result = "Experiments reduce reconstruction error by 12%, but thin structures remain a limitation."
+    excerpt = f"{introduction} {method} {elaboration} {result}"
+    selected = extract_sentences("Surface reconstruction", excerpt, kind="paper")
+    assert result in selected
+    assert introduction not in selected
+    assert len(selected) == 2
+    assert selected[0] in (method, elaboration)
+    assert all(sentence in excerpt for sentence in selected)
+
+
+def test_funding_extraction_keeps_announced_amount_and_application_terms_verbatim():
+    introduction = "Generative design and AI research are transforming computational design workflows."
+    announcement = "Mesh Lab secured a $2 million seed round for its parametric design tool."
+    terms = "The grant accepts applications from open-source maintainers until September 30, 2026."
+    excerpt = f"{introduction} {announcement} {terms}"
+    assert extract_sentences("Mesh Lab announcement", excerpt, kind="funding") == [announcement, terms]
+
+
+def test_showcase_extraction_keeps_how_it_works_and_demo_details():
+    introduction = "Generative art and computational design inspire creative coding and AI research."
+    technique = "The artwork uses a shader to map live weather readings onto moving geometric shapes."
+    demo = "Visitors can try the interactive demo in a browser and download the source code."
+    excerpt = f"{introduction} {technique} {demo}"
+    assert extract_sentences("Weather artwork", excerpt, kind="showcase") == [technique, demo]
+
+
+def test_extraction_prefers_self_contained_sentences_over_missing_pronoun_context():
+    dangling = "His research combines generative art and computational design on the blockchain."
+    fact = "The Mesh toolkit creates parametric surfaces from hand-drawn curves."
+    detail = "A public tutorial explains the implementation with working examples."
+    assert extract_sentences("Mesh toolkit", f"{dangling} {fact} {detail}") == [fact, detail]
+
+
+def test_paper_extraction_does_not_invent_missing_results_or_rewrite_pronouns():
+    method = "We propose a method for creating procedural geometry from sketches."
+    assert extract_sentences("Sketch geometry", method, kind="paper") == [method]
+
+
+def test_local_summarizer_uses_paper_selection_before_translation():
+    title = "Parametric surface reconstruction"
+    intro = "Computational design and AI algorithms support generative research."
+    method = "We propose a differentiable renderer for parametric surfaces."
+    result = "Experiments report 12% lower reconstruction error."
+    translator = FakeTranslator(
+        {
+            title: "파라메트릭 곡면 복원",
+            method: "파라메트릭 곡면을 위한 미분 가능 렌더러를 제안합니다.",
+            result: "실험에서 복원 오차가 12% 낮게 나타났습니다.",
+        }
+    )
+    summary = asyncio.run(
+        LocalSummarizer(translator=translator).summarize(
+            item(title, f"{intro} {method} {result}", kind="paper")
+        )
+    )
+    assert translator.calls == [title, method, result]
+    assert summary.bullets == (translator.answers[method], translator.answers[result])
+
+
+@pytest.mark.parametrize(
+    ("source", "translation", "expected"),
+    [
+        ("Models in the Wild", "야생의 모델", "실제 환경의 모델"),
+        ("non-manifold geometry", "비다중 기하", "비다양체 기하"),
+        ("non-watertight meshes", "방수가 되지 않는 메시", "밀폐되지 않은 메시"),
+        ("a computational framework", "컴퓨테이셔널 디자인 프레임워크", "계산 프레임워크"),
+    ],
+)
+def test_geometry_terms_are_corrected_only_with_corresponding_source_term(source, translation, expected):
+    assert _terms_in_korean(source, translation) == expected
+    assert _terms_in_korean("An unrelated source sentence", translation) == translation
+
+
+def test_authorial_pronouns_are_attributed_only_in_papers_and_when_present_in_source():
+    assert _terms_in_korean("We propose a method.", "우리는 방법을 제안합니다.", kind="paper") == (
+        "연구진은 방법을 제안합니다."
+    )
+    assert _terms_in_korean("Our method improves accuracy.", "우리의 방법은 정확도를 높입니다.", kind="paper") == (
+        "연구진의 방법은 정확도를 높입니다."
+    )
+    assert _terms_in_korean("We opened the studio.", "우리는 스튜디오를 열었습니다.") == (
+        "우리는 스튜디오를 열었습니다."
+    )
+    assert _terms_in_korean("An unrelated source.", "우리는 방법을 제안합니다.", kind="paper") == (
+        "우리는 방법을 제안합니다."
+    )
+
+
+@pytest.mark.parametrize("kind", ["paper", "news", "funding", "showcase"])
+def test_local_paper_bullets_allow_full_technical_sentence_without_widening_other_kinds(kind):
+    fact = (
+        "연구진은 웹 브라우저에서 기하학적 제약 조건과 복잡한 메시 구조를 직접 조작할 수 있도록 "
+        "미분 가능한 렌더링 방식과 실시간 최적화 알고리즘을 결합한 프레임워크를 제안하며 "
+        "별도 프로그램 설치 없이 WebGL 환경에서 결과를 확인할 수 있도록 구현했습니다."
+    )
+    assert 120 < len(fact) <= 160
+    summary = asyncio.run(
+        LocalSummarizer(translator=FakeTranslator({})).summarize(item("기하학 프레임워크 연구", fact, kind=kind))
+    )
+    if kind == "paper":
+        assert summary.bullets == (fact,)
+    else:
+        assert len(summary.bullets[0]) == 120
+        assert summary.bullets[0].endswith("…")

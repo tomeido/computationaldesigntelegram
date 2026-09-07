@@ -47,6 +47,7 @@ async def collect(settings: Settings, as_json: bool):
         {
             "priority": r.priority,
             "category": r.category,
+            "kind": r.article.kind,
             "score": r.score,
             "title": r.article.title,
             "url": r.article.url,
@@ -111,7 +112,7 @@ async def configure_bot(settings: Settings):
     description = (
         "Web3·블록체인과 컴퓨테이셔널 디자인의 접점을 먼저 전합니다. "
         "온체인 생성 예술, AI 디자인 도구, 파라메트릭 디자인, 크리에이티브 코딩 소식을 "
-        "한국어 발췌·번역과 원문 링크로 확인하세요.\n\n"
+        "논문·투자 및 지원 소식·작품과 실험까지 한국어 발췌·번역과 원문 링크로 확인하세요.\n\n"
         "/latest 최신 브리핑\n/sources 정보 출처\n/help 이용 안내"
     )
     commands = [

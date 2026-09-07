@@ -30,9 +30,20 @@ _SYSTEM_INSTRUCTION = (
     "Return a JSON object with a translations array in exactly the same order and length. "
     "Do not summarize, select facts, add explanations, research, or infer missing context. "
     "Preserve all numbers, dates, names, qualifications and tense faithfully. "
+    "Keep monetary expressions verbatim, including currency signs, digits and scale units "
+    "(for example, $2 million stays $2 million and $30M stays $30M). "
+    "Do not convert amounts, scale units or currencies; translate only the surrounding words. "
     "Keep established product and artist names when appropriate. "
     "Use 컴퓨테이셔널 디자인 for computational design, 파라메트릭 for parametric, "
-    "and 생성형 예술 for generative art."
+    "생성형 예술 for generative art, 계산 프레임워크 for computational framework, "
+    "실제 환경의 모델 for models in the wild, 비다양체 for non-manifold, "
+    "and 밀폐되지 않은 메시 for non-watertight meshes. "
+    "These geometry terms do not refer to wildlife, water resistance or multiple objects."
+)
+_ACADEMIC_INSTRUCTION = (
+    " These excerpts are from an academic paper. Render the authors' we as 연구진은 "
+    "and our as 연구진의 so the channel does not appear to be the author. "
+    "Do not invent author names."
 )
 
 
@@ -47,7 +58,7 @@ def validate_model(model: str) -> None:
 
 def cache_namespace(model: str = DEFAULT_GEMINI_MODEL) -> str:
     validate_model(model)
-    return f"gemini-translation-ko-guarded-v1:{model}"
+    return f"gemini-translation-ko-guarded-v3:{model}"
 
 
 def _unavailable(status: int) -> GeminiUnavailable:
@@ -119,14 +130,18 @@ class GeminiSummarizer:
         self.model = model
         self.namespace = cache_namespace(model)
 
-    async def _translate(self, texts: list[str]) -> list[str]:
+    async def _translate(self, texts: list[str], *, kind: str = "news") -> list[str]:
         if any(len(text) > 320 for text in texts):
             raise SummaryError("번역할 제목이나 문장이 너무 깁니다. 이번 기사는 발행하지 않습니다.")
         thinking = (
             {"thinkingLevel": "MINIMAL"} if self.model.startswith("gemini-3") else {"thinkingBudget": 0}
         )
         payload = {
-            "systemInstruction": {"parts": [{"text": _SYSTEM_INSTRUCTION}]},
+            "systemInstruction": {
+                "parts": [
+                    {"text": _SYSTEM_INSTRUCTION + (_ACADEMIC_INSTRUCTION if kind == "paper" else "")}
+                ]
+            },
             "contents": [{"role": "user", "parts": [{"text": json.dumps({"texts": texts})}]}],
             "generationConfig": {
                 "temperature": 0,
@@ -169,14 +184,14 @@ class GeminiSummarizer:
         article = item.article
         if not article.title.strip():
             return None
-        sentences = extract_sentences(article.title, article.summary)
+        sentences = extract_sentences(article.title, article.summary, article.kind)
         source_texts = list(dict.fromkeys([article.title, *sentences]))
         foreign_texts = [text for text in source_texts if not _is_korean(text)]
         translated = {text: text for text in source_texts if _is_korean(text)}
         if foreign_texts:
-            results = await self._translate(foreign_texts)
+            results = await self._translate(foreign_texts, kind=article.kind)
             for source, result in zip(foreign_texts, results, strict=True):
-                result = _terms_in_korean(source, result)
+                result = _terms_in_korean(source, result, kind=article.kind)
                 validate_translation(source, result)
                 translated[source] = result
         title = translated[article.title]
@@ -185,7 +200,7 @@ class GeminiSummarizer:
         evidence += "·기계번역 (Gemini)" if foreign_texts else " (한국어 원문)"
         return Summary(
             title=_bounded_korean(title, 65),
-            bullets=tuple(_bounded_korean(text, 120) for text in facts),
+            bullets=tuple(_bounded_korean(text, 160 if article.kind == "paper" else 120) for text in facts),
             why="세부 조건과 정확한 표현은 원문을 확인하세요.",
             evidence=evidence,
         )

@@ -20,9 +20,9 @@ TITLE = "Computational design research"
 FACT = "The open-source toolkit creates generative art on the blockchain."
 
 
-def item(title=TITLE, excerpt=FACT):
+def item(title=TITLE, excerpt=FACT, *, kind="news"):
     return RankedArticle(
-        Article(title, "https://example.com/research", "Research", excerpt, datetime.now(UTC)),
+        Article(title, "https://example.com/research", "Research", excerpt, datetime.now(UTC), kind=kind),
         1,
         10,
         "Web3 × 디자인",
@@ -62,6 +62,9 @@ def test_translates_only_selected_text_in_single_request_and_keeps_key_in_header
         assert KEY not in request.content.decode()
         assert "https://example.com/research" not in request.content.decode()
         assert "tools" not in payload
+        instruction = payload["systemInstruction"]["parts"][0]["text"]
+        assert "Keep monetary expressions verbatim" in instruction
+        assert "Do not convert amounts, scale units or currencies" in instruction
         texts = json.loads(payload["contents"][0]["parts"][0]["text"])["texts"]
         assert texts == [TITLE, FACT]
         config = payload["generationConfig"]
@@ -194,3 +197,78 @@ def test_cache_is_separate_from_local_and_other_models():
 def test_long_foreign_title_is_rejected_before_network():
     with pytest.raises(SummaryError, match="너무 깁니다"):
         run_summary(lambda _: pytest.fail("Unexpected network"), item("Design " * 100))
+
+
+def test_paper_sends_only_locally_selected_method_and_result_for_translation():
+    title = "Parametric surface reconstruction"
+    intro = "Computational design and generative algorithms are useful for creative geometry research."
+    method = "We propose a differentiable renderer for parametric surfaces."
+    result_sentence = "Experiments report 12% lower reconstruction error."
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        payload = json.loads(request.content)
+        texts = json.loads(payload["contents"][0]["parts"][0]["text"])["texts"]
+        assert texts == [title, method, result_sentence]
+        assert "tools" not in payload
+        return httpx.Response(
+            200,
+            json=result(
+                [
+                    "파라메트릭 곡면 복원",
+                    "파라메트릭 곡면을 위한 미분 가능 렌더러를 제안합니다.",
+                    "실험에서 복원 오차가 12% 낮게 나타났습니다.",
+                ]
+            ),
+        )
+
+    summary = run_summary(handler, item(title, f"{intro} {method} {result_sentence}", kind="paper"))
+    assert len(requests) == 1
+    assert len(summary.bullets) == 2
+    assert "12%" in summary.bullets[1]
+
+
+def test_paper_geometry_and_author_attribution_are_corrected_without_inventing_names():
+    title = "Models in the Wild"
+    fact = "We propose a computational framework for non-manifold and non-watertight meshes."
+
+    def handler(request):
+        payload = json.loads(request.content)
+        instruction = payload["systemInstruction"]["parts"][0]["text"]
+        assert "계산 프레임워크 for computational framework" in instruction
+        assert "비다양체 for non-manifold" in instruction
+        assert "authors' we as 연구진은" in instruction
+        assert "Do not invent author names" in instruction
+        return httpx.Response(
+            200,
+            json=result(
+                [
+                    "야생의 모델",
+                    "우리는 비다중 및 방수가 되지 않는 메시를 위한 컴퓨테이셔널 디자인 프레임워크를 제안합니다.",
+                ]
+            ),
+        )
+
+    summary = run_summary(handler, item(title, fact, kind="paper"))
+    assert summary.title == "실제 환경의 모델"
+    assert summary.bullets == ("연구진은 비다양체 및 밀폐되지 않은 메시를 위한 계산 프레임워크를 제안합니다.",)
+
+
+@pytest.mark.parametrize("kind", ["paper", "news", "funding", "showcase"])
+def test_gemini_paper_bullets_allow_full_technical_sentence_without_widening_other_kinds(kind):
+    fact = (
+        "연구진은 웹 브라우저에서 기하학적 제약 조건과 복잡한 메시 구조를 직접 조작할 수 있도록 "
+        "미분 가능한 렌더링 방식과 실시간 최적화 알고리즘을 결합한 프레임워크를 제안하며 "
+        "별도 프로그램 설치 없이 WebGL 환경에서 결과를 확인할 수 있도록 구현했습니다."
+    )
+    assert 120 < len(fact) <= 160
+    summary = run_summary(
+        lambda _: pytest.fail("Korean source requires no translation"),
+        item("기하학 프레임워크 연구", fact, kind=kind),
+    )
+    if kind == "paper":
+        assert summary.bullets == (fact,)
+    else:
+        assert len(summary.bullets[0]) == 120
+        assert summary.bullets[0].endswith("…")

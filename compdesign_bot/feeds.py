@@ -17,7 +17,7 @@ from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 import feedparser
 import httpx
 
-from compdesign_bot.models import Article
+from compdesign_bot.models import ARTICLE_KINDS, Article
 
 MAX_FEED_BYTES = 2 * 1024 * 1024
 MAX_ENTRIES_PER_SOURCE = 80
@@ -35,6 +35,7 @@ class Source:
     topic: str = ""
     weight: float = 1.0
     discovery: bool = False
+    kind: str = "news"
 
 
 @dataclass
@@ -126,6 +127,8 @@ def load_sources(path: Path) -> list[Source]:
             raise ValueError(f"Source {index} enabled/discovery must be booleans")
         if not isinstance(source.topic, str):
             raise ValueError(f"Source {index} topic must be text")  # noqa: TRY004 - invalid JSON data
+        if not isinstance(source.kind, str) or source.kind not in ARTICLE_KINDS:
+            raise ValueError(f"Source {index} kind must be news, paper, funding or showcase")
         if isinstance(source.weight, bool) or not isinstance(source.weight, (int, float)):
             raise ValueError(f"Source {index} weight must be a finite nonnegative number")  # noqa: TRY004
         if not math.isfinite(source.weight) or source.weight < 0:
@@ -186,6 +189,7 @@ def _parse_feed(content: bytes, source: Source, base_url: str) -> FetchReport:
                     source=source.name,
                     summary=summary,
                     published_at=_published_at(entry),
+                    kind=source.kind,
                 )
             )
         except (ValueError, TypeError, AttributeError):

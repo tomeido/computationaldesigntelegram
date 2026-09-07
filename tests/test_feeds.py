@@ -42,6 +42,18 @@ def test_load_sources_validates_configuration(tmp_path):
         load_sources(path)
 
 
+def test_content_kind_is_validated_and_preserved(tmp_path):
+    path = tmp_path / "sources.json"
+    for kind in ("paper", "funding", "showcase"):
+        path.write_text(json.dumps([{"name": "Example", "url": "https://example.com/rss", "kind": kind}]))
+        sources = load_sources(path)
+        report = run(sources, lambda request: httpx.Response(200, content=rss(item())))
+        assert report.articles[0].kind == kind
+    path.write_text(json.dumps([{"name": "Example", "url": "https://example.com/rss", "kind": "buy"}]))
+    with pytest.raises(ValueError, match="kind"):
+        load_sources(path)
+
+
 def test_canonical_url_preserves_article_identity():
     assert (
         canonical_url("https://EXAMPLE.com:443/story?utm_source=mail&id=2&fbclid=x#section")

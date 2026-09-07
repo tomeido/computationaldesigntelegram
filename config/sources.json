@@ -50,6 +50,31 @@
       "name": "Hugging Face Blog",
       "url": "https://huggingface.co/blog/feed.xml",
       "topic": "ai_design"
+    },
+    {
+      "name": "arXiv · 그래픽스 연구 논문",
+      "url": "https://export.arxiv.org/api/query?search_query=cat:cs.GR&sortBy=submittedDate&sortOrder=descending&max_results=40",
+      "topic": "computational_design",
+      "kind": "paper"
+    },
+    {
+      "name": "NVIDIA · 설계 기술·기업 공식 발표",
+      "url": "https://blogs.nvidia.com/feed/",
+      "topic": "ai_design",
+      "kind": "news"
+    },
+    {
+      "name": "Codrops · 창의적 코딩과 인터랙티브 작품",
+      "url": "https://tympanus.net/codrops/feed/",
+      "topic": "computational_design",
+      "kind": "showcase"
+    },
+    {
+      "name": "설계·생성예술 투자 동향 · Google News 검색 발견 (제목만)",
+      "url": "https://news.google.com/rss/search?q=%28%22computational+design%22+OR+%22generative+design%22+OR+%22generative+art%22+OR+%223D+modeling%22%29+%28funding+OR+raises+OR+investment+OR+grant+OR+acquisition%29+when%3A60d&hl=en-US&gl=US&ceid=US%3Aen",
+      "topic": "computational_design",
+      "kind": "funding",
+      "discovery": true
     }
   ]
 }

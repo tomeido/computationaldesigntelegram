@@ -1,6 +1,8 @@
 import asyncio
 import logging
+from collections import deque
 from dataclasses import dataclass
+from itertools import groupby
 
 import httpx
 
@@ -10,6 +12,7 @@ from .feeds import collect_articles, load_sources
 from .formatting import render_post
 from .gemini_summary import GeminiSummarizer, GeminiUnavailable, cache_namespace
 from .local_summary import CACHE_NAMESPACE, LocalSummarizer
+from .models import RankedArticle
 from .ranking import rank_articles
 from .storage import Store, cache_key, job_lock
 from .telegram import DeliveryUncertain, Telegram, TelegramError
@@ -24,6 +27,20 @@ class RunResult:
     posted: int = 0
     failed: int = 0
     messages: list[str] | None = None
+
+
+def varied_candidates(candidates: list[RankedArticle]) -> list[RankedArticle]:
+    """Alternate kinds within each topic priority, retaining order inside a kind."""
+    result: list[RankedArticle] = []
+    for _, items in groupby(candidates, key=lambda item: item.priority):
+        buckets: dict[str, deque[RankedArticle]] = {}
+        for item in items:
+            buckets.setdefault(item.article.kind, deque()).append(item)
+        while any(buckets.values()):
+            for bucket in buckets.values():
+                if bucket:
+                    result.append(bucket.popleft())
+    return result
 
 
 async def run_digest(settings: Settings, *, publish: bool = False, slot: str | None = None) -> RunResult:
@@ -54,7 +71,9 @@ async def run_digest(settings: Settings, *, publish: bool = False, slot: str | N
                     raise RuntimeError("기사를 수집하지 못했습니다. 피드 연결 상태를 확인하세요.")
                 ranked = rank_articles(report.articles, max_age_days=settings.max_age_days)
                 result = RunResult(fetched=len(report.articles), ranked=len(ranked), messages=[])
-                candidates = [item for item in ranked if not store.seen(item.article, channel)]
+                candidates = varied_candidates(
+                    [item for item in ranked if not store.seen(item.article, channel)]
+                )
                 if settings.translation_provider == "gemini":
                     settings.require_summary()
                     summarizer = GeminiSummarizer(

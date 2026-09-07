@@ -45,7 +45,7 @@ MODEL_METADATA = {
     "original_model": "https://huggingface.co/facebook/m2m100_418M",
     "license": "MIT",
 }
-CACHE_NAMESPACE = "local-m2m100-en-ko-guarded-v3"
+CACHE_NAMESPACE = "local-m2m100-en-ko-guarded-v5"
 _HANGUL = re.compile(r"[가-힣]")
 _TOPICS = re.compile(
     r"computational|generative|algorithm|parametric|procedural|creative coding|"
@@ -64,6 +64,59 @@ _BOILERPLATE = re.compile(
     r"all rights reserved\b|the post .+ appeared first|arxiv:|구독|더 읽기)",
     re.IGNORECASE,
 )
+_CONTEXT_DEPENDENT = re.compile(
+    r"^(?:he|she|it|they|his|her|their|its)\b|"
+    r"^(?:this|these|those)\s+(?:is|are|was|were|has|have|allows?|enables?|"
+    r"provides?|shows?|means?|can|could|will|would)\b|"
+    r"^(?:그는|그녀는|그의|그들의|이것은|이들은|이는)\s",
+    re.IGNORECASE,
+)
+# Each pair describes an announcement/contribution and a useful supporting
+# detail. These signals only select existing sentences; they never supply facts.
+_KIND_SIGNALS = {
+    "paper": (
+        re.compile(
+            r"\b(?:propose[sd]?|present[sd]?|introduce[sd]?|develop(?:ed|s)?)\b|"
+            r"\b(?:method|framework|algorithm|model|system)\s+"
+            r"(?:uses?|combines?|learns?|generates?|optimizes?)\b|"
+            r"제안|제시|개발|방법론|프레임워크",
+            re.IGNORECASE,
+        ),
+        re.compile(
+            r"\b(?:outperform\w*|benchmark\w*|evaluat\w*|experiment\w*|results?|"
+            r"accuracy|reduces?|reduced|improv\w*|limitations?|fails?|cannot)\b|"
+            r"\blimited to\b|평가|실험|성능|결과|한계|감소|개선",
+            re.IGNORECASE,
+        ),
+    ),
+    "funding": (
+        re.compile(
+            r"\b(?:raises?|raised|secures?|secured|funding|financing|investment|"
+            r"invested|grants?)\b|\b(?:seed round|series [a-e]|led by)\b|"
+            r"투자|유치|지원금|보조금|선정",
+            re.IGNORECASE,
+        ),
+        re.compile(
+            r"[$€£₩]\s*\d|\b\d[\d,.]*\s*(?:million|billion|USD|EUR|KRW)\b|"
+            r"\b(?:applications?|eligible|eligibility|deadline|closes?|apply by)\b|"
+            r"신청|마감|자격|지원 대상|모집|\d[\d,.]*\s*(?:억|만)\s*원",
+            re.IGNORECASE,
+        ),
+    ),
+    "showcase": (
+        re.compile(
+            r"\b(?:uses?|using|built|combines?|maps?|generates?|renders?|shaders?)\b|"
+            r"\b(?:made with|powered by|runs? on)\b|"
+            r"사용|활용|구현|제작|결합|생성|렌더링|셰이더",
+            re.IGNORECASE,
+        ),
+        re.compile(
+            r"\b(?:source code|open.source|demo|interactive|browser|repository|"
+            r"try it|try the|play with)\b|소스 코드|오픈소스|데모|체험|브라우저|저장소",
+            re.IGNORECASE,
+        ),
+    ),
+}
 
 
 class Translator(Protocol):
@@ -260,7 +313,7 @@ def validate_translation(source: str, translation: str) -> None:
         raise SummaryError("번역문에 비정상적인 반복이 있어 발행하지 않습니다.")
 
 
-def _terms_in_korean(source: str, translation: str) -> str:
+def _terms_in_korean(source: str, translation: str, *, kind: str = "news") -> str:
     """Normalize established terms only when the corresponding source phrase exists."""
     glossary = (
         (
@@ -273,18 +326,53 @@ def _terms_in_korean(source: str, translation: str) -> str:
         (r"\bgenerative design\b", r"generative design|유전 설계|유전자 디자인", "생성형 디자인"),
         (r"\bopen.source\b", r"open.source", "오픈소스"),
         (r"\btoolkit\b", r"toolkit", "툴키트"),
+        (
+            r"\bmodels? in the wild\b",
+            r"야생(?:의|에서의)?\s*모델|자연 상태의 모델|models? in the wild",
+            "실제 환경의 모델",
+        ),
+        (
+            r"\bnon[\s‐‑–-]?manifold\b",
+            r"비\s*다중|비\s*매니폴드|non[\s‐‑–-]?manifold",
+            "비다양체",
+        ),
+        (
+            r"\bnon[\s‐‑–-]?watertight\b",
+            (
+                r"방수(?:가)?\s*(?:되지\s*않는|되지\s*않은|안\s*되는)|"
+                r"비\s*방수|non[\s‐‑–-]?watertight"
+            ),
+            "밀폐되지 않은",
+        ),
+        (
+            r"\bcomputational framework\b",
+            r"컴퓨테이셔널(?:\s*디자인)?\s*프레임워크|컴퓨터\s*프레임워크|computational framework",
+            "계산 프레임워크",
+        ),
     )
     for source_pattern, translated_pattern, replacement in glossary:
         if re.search(source_pattern, source, re.IGNORECASE):
             translation = re.sub(translated_pattern, replacement, translation, flags=re.IGNORECASE)
+    if kind == "paper":
+        if re.search(r"\bwe\b", source, re.IGNORECASE):
+            translation = re.sub(r"우리는|저희는", "연구진은", translation)
+            translation = re.sub(r"우리가|저희가", "연구진이", translation)
+        if re.search(r"\bour\b", source, re.IGNORECASE):
+            translation = re.sub(r"우리의|저희의", "연구진의", translation)
     return translation
 
 
-def extract_sentences(title: str, excerpt: str) -> list[str]:
-    """Choose at most two complete source sentences and preserve their order."""
+def extract_sentences(title: str, excerpt: str, kind: str = "news") -> list[str]:
+    """Choose source sentences, favoring the useful details for each content kind.
+
+    Papers pair a contribution with evidence/limitations, funding pairs an
+    announcement with amounts/terms, and showcases pair technique with a demo.
+    Missing details are never inferred, and selected text stays in source order.
+    """
     normalized_title = re.sub(r"\W+", "", title).casefold()
-    candidates: list[tuple[int, str, int]] = []
+    candidates: list[tuple[int, str, int, bool, bool]] = []
     seen: set[str] = set()
+    signals = _KIND_SIGNALS.get(kind)
     for index, sentence in enumerate(re.split(r"(?<=[.!?。！？])\s+|[\r\n]+", excerpt[:6000])):
         sentence = " ".join(sentence.split())
         normalized = re.sub(r"\W+", "", sentence).casefold()
@@ -302,9 +390,27 @@ def extract_sentences(title: str, excerpt: str) -> list[str]:
             continue
         seen.add(normalized)
         score = 3 * len(_TOPICS.findall(sentence)) + 2 * len(_USEFUL.findall(sentence))
-        candidates.append((index, sentence, score))
-    selected = sorted(candidates, key=lambda item: (-item[2], item[0]))[:2]
-    return [sentence for _, sentence, _ in sorted(selected)]
+        primary = bool(signals and signals[0].search(sentence))
+        detail = bool(signals and signals[1].search(sentence))
+        context_dependent = bool(_CONTEXT_DEPENDENT.search(sentence))
+        if signals:
+            # A keyword-heavy introduction must not crowd out an actual result,
+            # deadline or explanation of how a project works.
+            score = min(score, 12) + 16 * primary + 16 * detail
+        if context_dependent:
+            score -= 24
+        candidates.append(
+            (index, sentence, score, primary and not context_dependent, detail and not context_dependent)
+        )
+    ordered = sorted(candidates, key=lambda item: (-item[2], item[0]))
+    if not ordered:
+        return []
+    first = next((candidate for candidate in ordered if candidate[3]), ordered[0])
+    remaining = [candidate for candidate in ordered if candidate[0] != first[0]]
+    selected = [first]
+    if remaining:
+        selected.append(next((candidate for candidate in remaining if candidate[4]), remaining[0]))
+    return [candidate[1] for candidate in sorted(selected)]
 
 
 class LocalSummarizer:
@@ -323,7 +429,7 @@ class LocalSummarizer:
         article = item.article
         if not article.title.strip():
             return None
-        sentences = extract_sentences(article.title, article.summary)
+        sentences = extract_sentences(article.title, article.summary, article.kind)
         source_texts = [article.title, *(sentences or [article.title])]
 
         def translate_all() -> tuple[list[str], bool, bool]:
@@ -335,7 +441,7 @@ class LocalSummarizer:
                 if _is_korean(text):
                     translated[text] = text
                 else:
-                    result = _terms_in_korean(text, self.translator.translate(text))
+                    result = _terms_in_korean(text, self.translator.translate(text), kind=article.kind)
                     try:
                         validate_translation(text, result)
                     except SummaryError:
@@ -357,7 +463,7 @@ class LocalSummarizer:
             evidence += " (한국어 원문)"
         return Summary(
             title=_bounded_korean(texts[0], 65),
-            bullets=tuple(_bounded_korean(text, 120) for text in texts[1:]),
+            bullets=tuple(_bounded_korean(text, 160 if article.kind == "paper" else 120) for text in texts[1:]),
             why="세부 조건과 정확한 표현은 원문을 확인하세요.",
             evidence=evidence,
         )

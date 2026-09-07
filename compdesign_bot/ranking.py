@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import re
 import unicodedata
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
@@ -47,6 +48,19 @@ _DESIGN = _terms(
     "procedural geometry",
     "procedural design",
     "procedural art",
+    "computational fabrication",
+    "digital fabrication",
+    "parametric cad",
+    "generative cad",
+    "cad synthesis",
+    "cad generation",
+    "text to cad",
+    "text to 3d",
+    "image to 3d",
+    "3d asset generation",
+    "3d content generation",
+    "shape generation",
+    "geometric deep learning for design",
     "creative coding",
     "geometry nodes",
     "code art",
@@ -88,8 +102,130 @@ _DESIGN = _terms(
     "크리에이티브 코딩",
     "코딩 아트",
     "지오메트리 노드",
+    "디지털 제작",
+    "디지털 패브리케이션",
+    "계산 제작",
+    "형상 생성",
+    "3d 에셋 생성",
 )
-_DESIGN_TOOLS = _terms("p5.js", "p5js", "touchdesigner", "openframeworks", "cables.gl")
+# These methods also occur in unrelated science and computer vision. Require
+# explicit geometry, fabrication, or creative modelling evidence alongside them.
+_RESEARCH_METHODS = _terms(
+    "inverse design",
+    "inverse graphics",
+    "topology optimization",
+    "topology optimisation",
+    "shape optimization",
+    "shape optimisation",
+    "differentiable rendering",
+    "역설계",
+    "위상 최적화",
+    "형상 최적화",
+    "미분 가능 렌더링",
+)
+_RESEARCH_CONTEXT = _terms(
+    "geometry",
+    "geometric",
+    "shape",
+    "shapes",
+    "mesh",
+    "meshes",
+    "cad",
+    "fabrication",
+    "3d printing",
+    "additive manufacturing",
+    "architecture",
+    "structural design",
+    "material design",
+    "truss",
+    "lattice",
+    "기하",
+    "형상",
+    "메시",
+    "제작",
+    "3d 프린팅",
+    "적층 제조",
+    "건축",
+    "구조 설계",
+)
+_AI_3D_CREATION = _terms(
+    "3d modeling",
+    "3d modelling",
+    "3d model generation",
+    "3d asset creation",
+    "3d content creation",
+    "3d 모델링",
+    "3d 모델 생성",
+)
+_ANIMATION_METHODS = _terms(
+    "skinning",
+    "rigging",
+    "mesh deformation",
+    "skinned gaussian",
+    "skeletal animation",
+    "스키닝",
+    "리깅",
+    "메시 변형",
+)
+_LAYOUT_METHODS = _terms(
+    "layout optimization",
+    "layout optimisation",
+    "layout generation",
+    "layout synthesis",
+    "automated layout",
+    "exploratory design",
+    "레이아웃 최적화",
+    "레이아웃 생성",
+)
+_LAYOUT_CONTEXT = _terms("layout", "layouts", "typography", "typographic", "레이아웃", "타이포그래피")
+_COMPUTATIONAL_METHODS = _terms(
+    "algorithm",
+    "algorithms",
+    "optimization",
+    "optimisation",
+    "neural network",
+    "neural networks",
+    "constraint solver",
+    "알고리즘",
+    "최적화",
+    "신경망",
+)
+_GRAPHICS_API = _terms("webgpu", "webgl", "tsl")
+_VISUAL_EXPERIMENT = _terms(
+    "drawing",
+    "lighting",
+    "tubes",
+    "shader",
+    "rendering",
+    "visual effects",
+    "particles",
+    "셰이더",
+    "시각 효과",
+)
+_UNRELATED_RESEARCH = _terms(
+    "drug discovery",
+    "drug design",
+    "drug molecules",
+    "molecular design",
+    "molecular generation",
+    "molecule generation",
+    "protein design",
+    "신약 개발",
+    "약물 설계",
+    "분자 설계",
+    "단백질 설계",
+)
+_DESIGN_TOOLS = _terms(
+    "p5.js",
+    "p5js",
+    "touchdesigner",
+    "openframeworks",
+    "cables.gl",
+    "three.js",
+    "threejs",
+    "babylon.js",
+    "threlte",
+)
 _AMBIGUOUS_TOOLS = _terms("grasshopper", "houdini", "processing", "rhino", "glsl")
 _TOOL_CONTEXT = _terms(
     "3d",
@@ -258,6 +394,61 @@ _USEFUL = _terms(
     "출시",
     "공개",
 )
+_FUNDING_EVENTS = _terms(
+    "funding round",
+    "financing round",
+    "seed funding",
+    "seed investment",
+    "venture funding",
+    "series a funding",
+    "series b funding",
+    "series c funding",
+    "series a round",
+    "series b round",
+    "series c round",
+    "grant program",
+    "grants program",
+    "grant programme",
+    "grant applications",
+    "grant application",
+    "grant funding",
+    "research grant",
+    "artist grant",
+    "artist grants",
+    "acquired by",
+    "acquisition deal",
+    "initial public offering",
+    "ipo",
+    "투자 유치",
+    "투자유치",
+    "시드 투자",
+    "지원금",
+    "연구비",
+    "창작 지원",
+    "기업공개",
+)
+_FUNDING_AMOUNT = re.compile(
+    r"\b(?:raises?|raised|secures?|secured|receives?|received)\s+(?:an?\s+)?"
+    r"(?:[$€£]\s*\d|\d[\d,.]*\s*(?:million|billion|usd|eur|krw)\b)",
+    re.IGNORECASE,
+)
+_PAPER_TITLE = re.compile(
+    r"^(?:(?:new\s+)?research paper|preprint|논문|프리프린트)\s*[:：]",
+    re.IGNORECASE,
+)
+_SHOWCASE_TITLE = _terms(
+    "creative project",
+    "art project",
+    "generative art project",
+    "demo",
+    "interactive artwork",
+    "interactive installation",
+    "playground",
+    "데모",
+    "인터랙티브 작품",
+    "인터랙티브 설치",
+    "실험작",
+)
 _TRACKING_PARAMS = {"fbclid", "gclid", "dclid", "mc_cid", "mc_eid", "igshid"}
 _PRIMARY_DOMAINS = {
     "artblocks.io",
@@ -306,6 +497,30 @@ def _utc(value: datetime) -> datetime:
     return value.astimezone(UTC)
 
 
+def _has_funding_evidence(body: str) -> bool:
+    return bool(_FUNDING_EVENTS.search(body) or _FUNDING_AMOUNT.search(body))
+
+
+def _infer_kind(article: Article, body: str, host: str) -> Article:
+    """Keep source labels; infer a label only from explicit publication evidence."""
+    if article.kind != "news":
+        return article
+    try:
+        path = urlsplit(article.url).path
+    except ValueError:
+        path = ""
+    paper_url = (
+        (host == "arxiv.org" or host.endswith(".arxiv.org")) and path.startswith(("/abs/", "/pdf/", "/html/"))
+    ) or (host in {"doi.org", "dx.doi.org", "dl.acm.org"} and path.startswith(("/10.", "/doi/10.")))
+    if paper_url or _PAPER_TITLE.search(article.title):
+        return replace(article, kind="paper")
+    if _has_funding_evidence(body):
+        return replace(article, kind="funding")
+    if _SHOWCASE_TITLE.search(article.title):
+        return replace(article, kind="showcase")
+    return article
+
+
 def rank_articles(
     articles: list[Article], *, now: datetime | None = None, max_age_days: int = 7
 ) -> list[RankedArticle]:
@@ -326,12 +541,42 @@ def rank_articles(
         if age > timedelta(days=max_age_days) or age < -timedelta(hours=6):
             continue
         body = _text(f"{article.title}\n{article.summary}")
+        if _UNRELATED_RESEARCH.search(body):
+            continue
+        # Discovery queries can match text that is absent from the supplied RSS
+        # headline. A source hint alone cannot establish a funding event.
+        if article.kind == "funding" and not _has_funding_evidence(body):
+            continue
+        try:
+            host = (urlsplit(article.url).hostname or "").lower()
+        except ValueError:
+            host = ""
+        article = _infer_kind(article, body, host)
         design_hits = len(_DESIGN.findall(body))
+        research_design = bool(_RESEARCH_METHODS.search(body) and _RESEARCH_CONTEXT.search(body))
+        animation_design = bool(_ANIMATION_METHODS.search(body) and _RESEARCH_CONTEXT.search(body))
+        layout_research = bool(
+            article.kind == "paper"
+            and _LAYOUT_METHODS.search(body)
+            and _LAYOUT_CONTEXT.search(body)
+            and _COMPUTATIONAL_METHODS.search(body)
+        )
+        graphics_experiment = bool(_GRAPHICS_API.search(body) and _VISUAL_EXPERIMENT.search(body))
+        ai_creation = bool(_AI.search(body) and _AI_3D_CREATION.search(body))
         platform_art = bool(_ART_PLATFORMS.search(body) and _GEN_ART_CONTEXT.search(body))
         tool_design = bool(
             _DESIGN_TOOLS.search(body) or (_AMBIGUOUS_TOOLS.search(body) and _TOOL_CONTEXT.search(body))
         )
-        if not (design_hits or platform_art or tool_design):
+        if not (
+            design_hits
+            or platform_art
+            or tool_design
+            or research_design
+            or animation_design
+            or layout_research
+            or graphics_experiment
+            or ai_creation
+        ):
             continue
         if _SPAM.search(body):
             continue
@@ -347,10 +592,6 @@ def rank_articles(
         else:
             priority, category = 3, "컴퓨테이셔널 디자인"
         recency = max(0.0, 1.0 - max(0.0, age.total_seconds()) / (max(1, max_age_days) * 86400))
-        try:
-            host = (urlsplit(article.url).hostname or "").lower()
-        except ValueError:
-            host = ""
         primary = any(host == domain or host.endswith("." + domain) for domain in _PRIMARY_DOMAINS)
         score = (
             min(design_hits, 4) * 3

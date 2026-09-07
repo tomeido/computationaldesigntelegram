@@ -7,13 +7,14 @@ from compdesign_bot.ranking import rank_articles
 NOW = datetime(2026, 9, 7, 12, tzinfo=UTC)
 
 
-def article(title, *, summary="", url=None, age=timedelta(hours=1), published=None):
+def article(title, *, summary="", url=None, age=timedelta(hours=1), published=None, kind="news"):
     return Article(
         title=title,
         url=url or "https://example.com/" + title.replace(" ", "-"),
         source="Example",
         summary=summary,
         published_at=published if published is not None else NOW - age,
+        kind=kind,
     )
 
 
@@ -125,6 +126,178 @@ class RankingTests(unittest.TestCase):
     def test_invalid_max_age(self):
         with self.assertRaises(ValueError):
             rank_articles([], now=NOW, max_age_days=-1)
+
+    def test_geometry_research_and_cad_papers_are_relevant(self):
+        papers = [
+            article(
+                "Inverse design of printable lattice structures",
+                summary="The paper optimizes geometry for additive manufacturing.",
+                url="https://arxiv.org/abs/2609.00001",
+            ),
+            article(
+                "Topology optimization for truss fabrication",
+                url="https://arxiv.org/pdf/2609.00002",
+            ),
+            article(
+                "Differentiable rendering for editable mesh geometry",
+                url="https://arxiv.org/html/2609.00003v1",
+            ),
+            article(
+                "LLM CAD synthesis from text instructions",
+                url="https://dl.acm.org/doi/10.1145/123456",
+            ),
+        ]
+        ranked = rank_articles(papers, now=NOW)
+        self.assertEqual(len(ranked), 4)
+        self.assertTrue(all(item.article.kind == "paper" for item in ranked))
+        self.assertEqual(ranked[0].priority, 2)
+
+    def test_research_topics_need_design_context(self):
+        unrelated = [
+            article("Differentiable rendering improves object detection", kind="paper"),
+            article("Inverse design for drug discovery", kind="paper"),
+            article("Generative design of drug molecules with AI", kind="paper"),
+            article("AI protein design with a generative design algorithm", kind="paper"),
+            article("Topology optimization of network packet routing", kind="paper"),
+        ]
+        self.assertEqual(rank_articles(unrelated, now=NOW), [])
+
+    def test_design_funding_and_support_are_selected(self):
+        titles = [
+            "Generative CAD startup raises $20 million",
+            "AI 3D modeling platform secures €4 million",
+            "Creative coding artist grants program opens applications",
+            "온체인 생성형 아트 창작 지원금 신청 접수",
+        ]
+        ranked = rank_articles([article(title) for title in titles], now=NOW)
+        self.assertEqual(len(ranked), 4)
+        self.assertTrue(all(item.article.kind == "funding" for item in ranked))
+        self.assertEqual([item.priority for item in ranked], [1, 2, 3, 3])
+
+    def test_generic_funding_and_crypto_prices_are_rejected(self):
+        unrelated = [
+            article("AI assistant startup raises $100 million", kind="funding"),
+            article("Blockchain exchange announces a seed funding round", kind="funding"),
+            article("Art Blocks generative art token price reaches new high", kind="funding"),
+            article("NFT investment firm receives $10 million", kind="funding"),
+        ]
+        self.assertEqual(rank_articles(unrelated, now=NOW), [])
+
+    def test_programming_raise_and_license_grants_are_not_funding(self):
+        item = article(
+            "Creative coding tutorial raises exceptions for malformed shaders",
+            summary="The open source license grants permission to use the code.",
+        )
+        ranked = rank_articles([item], now=NOW)
+        self.assertEqual(ranked[0].article.kind, "news")
+
+    def test_funding_source_hint_requires_actual_funding_evidence(self):
+        unsupported = article(
+            "Generative Design Optimizes Liquid-Cooling Channels For 2.5D And 3D Packages",
+            kind="funding",
+        )
+        generic = article("Generative design investment trends", kind="funding")
+        funded = article("Generative CAD startup raises $20 million", kind="funding")
+        supported = article("Creative coding artist grant applications open", kind="funding")
+        ipo = article("AI 3D modeling startup announces initial public offering", kind="funding")
+        ranked = rank_articles([unsupported, generic, funded, supported, ipo], now=NOW)
+        self.assertEqual({item.article for item in ranked}, {funded, supported, ipo})
+
+    def test_showcase_requires_explicit_creative_project_or_demo(self):
+        demos = [
+            article("A p5.js interactive artwork turns wind into geometry"),
+            article("Generative art project creates a playable landscape"),
+            article("파라메트릭 디자인 인터랙티브 작품 공개"),
+        ]
+        ranked = rank_articles(demos, now=NOW)
+        self.assertEqual(len(ranked), 3)
+        self.assertTrue(all(item.article.kind == "showcase" for item in ranked))
+
+    def test_source_kind_is_preserved_but_does_not_override_relevance(self):
+        supplied = article(
+            "Computational design grant recipients present an interactive artwork",
+            kind="showcase",
+        )
+        irrelevant = article("A gardening paper about feeding plants", kind="paper")
+        ranked = rank_articles([supplied, irrelevant], now=NOW)
+        self.assertEqual([item.article for item in ranked], [supplied])
+
+    def test_kind_does_not_change_hard_topic_priorities(self):
+        web3 = article("Onchain generative art demo", age=timedelta(days=6))
+        ai = article("AI generative CAD seed funding round")
+        paper = article(
+            "Topology optimization for lattice geometry",
+            age=timedelta(minutes=1),
+            url="https://arxiv.org/abs/2609.01234",
+        )
+        ranked = rank_articles([paper, ai, web3], now=NOW)
+        self.assertEqual([item.priority for item in ranked], [1, 2, 3])
+        self.assertEqual([item.article.kind for item in ranked], ["showcase", "funding", "paper"])
+
+    def test_paper_mentions_and_lookalike_domains_do_not_imply_papers(self):
+        items = [
+            article(
+                "Computational design tool release",
+                summary="The team cites a recent research paper in its documentation.",
+            ),
+            article("Generative art news", url="https://notarxiv.org/abs/2609.12345"),
+            article("Creative coding news", url="https://arxiv.org/news"),
+        ]
+        ranked = rank_articles(items, now=NOW)
+        self.assertEqual(len(ranked), 3)
+        self.assertTrue(all(item.article.kind == "news" for item in ranked))
+
+    def test_explicit_paper_heading_is_classified(self):
+        item = article("논문: CAD synthesis with diffusion models")
+        ranked = rank_articles([item], now=NOW)
+        self.assertEqual(ranked[0].article.kind, "paper")
+
+    def test_layout_and_animation_research_have_creation_context(self):
+        papers = [
+            article(
+                "LayoutShop: Content-Constrained Exploratory Design of Creative Article Layout",
+                summary="The algorithm uses two neural networks to optimize geometry and layout.",
+                kind="paper",
+            ),
+            article(
+                "GradRig: Differentiable Weights for Skinned Gaussian Splat Deformation",
+                summary="Skinning deforms a 3D shape, with support for meshes and a WebGL viewer.",
+                kind="paper",
+            ),
+        ]
+        ranked = rank_articles(papers, now=NOW)
+        self.assertEqual(len(ranked), 2)
+        self.assertTrue(all(item.article.kind == "paper" for item in ranked))
+
+    def test_creative_graphics_demos_are_selected(self):
+        demos = [
+            article(
+                "Drawing With Light: An Exploration of Lit GPU Tubes with TSL and WebGPU",
+                kind="showcase",
+            ),
+            article(
+                "Building a Real-Time 3D Face Mask with MediaPipe, Threlte and Three.js",
+                kind="showcase",
+            ),
+            article(
+                "Building an Infinite Loom: Unravelling Images into Threads with Three.js",
+                kind="showcase",
+            ),
+        ]
+        ranked = rank_articles(demos, now=NOW)
+        self.assertEqual(len(ranked), 3)
+        self.assertTrue(all(item.article.kind == "showcase" for item in ranked))
+
+    def test_general_layout_marketing_and_gpu_benchmarks_are_excluded(self):
+        unrelated = [
+            article(
+                "Exploratory design of a new article layout",
+                summary="Our marketing team selected a fresh layout for the campaign.",
+            ),
+            article("WebGPU compute benchmark makes matrix multiplication faster", kind="paper"),
+            article("An AI rigging investigation of an election result", kind="paper"),
+        ]
+        self.assertEqual(rank_articles(unrelated, now=NOW), [])
 
 
 if __name__ == "__main__":

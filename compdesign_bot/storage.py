@@ -19,7 +19,9 @@ def identity(article: Article) -> tuple[str, str]:
 
 
 def cache_key(article: Article, model: str) -> str:
-    raw = json.dumps(["v1", model, article.title, article.summary, article.source], ensure_ascii=False)
+    raw = json.dumps(
+        ["v2", model, article.kind, article.title, article.summary, article.source], ensure_ascii=False
+    )
     return hashlib.sha256(raw.encode()).hexdigest()
 
 
