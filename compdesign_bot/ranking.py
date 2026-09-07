@@ -501,6 +501,35 @@ def _has_funding_evidence(body: str) -> bool:
     return bool(_FUNDING_EVENTS.search(body) or _FUNDING_AMOUNT.search(body))
 
 
+def _connected_web3_design(article: Article) -> bool:
+    """A Web3 mention elsewhere in an artist's biography is not a topic link.
+
+    Require the design work and its Web3 context in the headline or one source
+    sentence. Only release sources may use the maintained repository context;
+    the quality gate separately evaluates their actual changelog.
+    """
+    units = [article.title, *re.split(r"(?<=[.!?。])\s+|\n+", article.summary)]
+    if article.kind == "release" and article.topic_context:
+        units.append(article.topic_context)
+    for unit in units:
+        text = _text(unit)
+        platform = bool(_ART_PLATFORMS.search(text))
+        if not (_WEB3.search(text) or platform):
+            continue
+        design = bool(
+            _DESIGN.search(text)
+            or (platform and _GEN_ART_CONTEXT.search(text))
+            or _DESIGN_TOOLS.search(text)
+            or (_AMBIGUOUS_TOOLS.search(text) and _TOOL_CONTEXT.search(text))
+            or (_RESEARCH_METHODS.search(text) and _RESEARCH_CONTEXT.search(text))
+            or (_ANIMATION_METHODS.search(text) and _RESEARCH_CONTEXT.search(text))
+            or (_AI.search(text) and _AI_3D_CREATION.search(text))
+        )
+        if design:
+            return True
+    return False
+
+
 def _infer_kind(article: Article, body: str, host: str) -> Article:
     """Keep source labels; infer a label only from explicit publication evidence."""
     if article.kind != "news":
@@ -540,7 +569,10 @@ def rank_articles(
         age = current - _utc(article.published_at)
         if age > timedelta(days=max_age_days) or age < -timedelta(hours=6):
             continue
-        body = _text(f"{article.title}\n{article.summary}")
+        # Curated repository context establishes subject relevance, never a new
+        # feature. The independent quality stage reads only source changelog text.
+        context = article.topic_context if article.kind == "release" else ""
+        body = _text(f"{article.title}\n{article.summary}\n{context}")
         if _UNRELATED_RESEARCH.search(body):
             continue
         # Discovery queries can match text that is absent from the supplied RSS
@@ -583,7 +615,7 @@ def rank_articles(
         useful_hits = len(_USEFUL.findall(body))
         if _TRADING.search(body) and not useful_hits:
             continue
-        web3 = bool(_WEB3.search(body) or _ART_PLATFORMS.search(body))
+        web3 = _connected_web3_design(article)
         ai = bool(_AI.search(body))
         if web3:
             priority, category = 1, "Web3 × 디자인"
@@ -596,7 +628,7 @@ def rank_articles(
         score = (
             min(design_hits, 4) * 3
             + min(useful_hits, 4) * 4
-            + (50 if web3 and ai else 0)
+            + (4 if web3 and ai else 0)
             + (3 if tool_design else 0)
             + (3 if primary else 0)
             + recency * 6

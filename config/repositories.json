@@ -1,0 +1,43 @@
+{
+  "repositories": [
+    {
+      "owner": "ArtBlocks",
+      "name": "artblocks-contracts",
+      "why": "온체인 생성예술의 발행 구조와 스마트컨트랙트 구현을 살펴볼 때 유용합니다.",
+      "topic": "Web3 blockchain onchain generative art creative coding",
+      "docs_url": "https://github.com/ArtBlocks/artblocks-contracts/blob/main/packages/contracts/README.md"
+    },
+    {
+      "owner": "fxhash",
+      "name": "onchfs",
+      "why": "웹 기반 생성예술의 코드와 파일을 블록체인에 보존하는 방식을 탐색할 수 있습니다.",
+      "topic": "Web3 blockchain onchain generative art creative coding",
+      "docs_url": "https://onchfs.com/",
+      "example_url": "https://github.com/fxhash/onchfs/tree/main/examples"
+    },
+    {
+      "owner": "compas-dev",
+      "name": "compas",
+      "why": "Python으로 기하를 다루고 Rhino·Grasshopper·Blender를 연결하는 설계 작업에 유용합니다.",
+      "topic": "computational design parametric design geometry digital fabrication Rhino Grasshopper Blender",
+      "docs_url": "https://compas.dev/compas/latest/",
+      "example_url": "https://compas.dev/compas/latest/userguide/basics.geometry.html"
+    },
+    {
+      "owner": "processing",
+      "name": "p5.js",
+      "why": "브라우저에서 생성예술과 인터랙션을 만들고 공식 예제를 변형하며 실험할 수 있습니다.",
+      "topic": "creative coding generative art computational design interactive art",
+      "docs_url": "https://p5js.org/reference/",
+      "example_url": "https://p5js.org/examples/"
+    },
+    {
+      "owner": "NVIDIA",
+      "name": "warp",
+      "why": "물리 시뮬레이션·기하 처리·최적화로 설계 실험을 할 때 참고할 수 있습니다.",
+      "topic": "AI differentiable simulation geometry processing computational design",
+      "docs_url": "https://nvidia.github.io/warp/",
+      "example_url": "https://github.com/NVIDIA/warp/tree/main/warp/examples"
+    }
+  ]
+}

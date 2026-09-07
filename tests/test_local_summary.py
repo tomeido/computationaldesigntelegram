@@ -15,10 +15,13 @@ from compdesign_bot.local_summary import (
     MODEL_METADATA,
     LocalSummarizer,
     OfflineTranslator,
+    _bounded_korean,
     _download_model,
     _terms_in_korean,
     check_model,
     extract_sentences,
+    protect_release_identifiers,
+    restore_release_identifiers,
     setup_model,
     validate_translation,
 )
@@ -42,6 +45,13 @@ class FakeTranslator:
     def translate(self, text):
         self.calls.append(text)
         return self.answers[text]
+
+
+def test_release_core_version_is_a_software_component_not_a_key_point():
+    assert _terms_in_korean(
+        "Core v3.3: transfer hooks", "핵심 v3.3: 전송 훅", kind="release"
+    ) == "코어 v3.3: 전송 훅"
+    assert _terms_in_korean("Core ideas", "핵심 아이디어", kind="release") == "핵심 아이디어"
 
 
 def test_offline_summary_translates_only_source_facts_and_makes_no_http_calls():
@@ -299,6 +309,66 @@ def test_showcase_extraction_keeps_how_it_works_and_demo_details():
     assert extract_sentences("Weather artwork", excerpt, kind="showcase") == [technique, demo]
 
 
+def test_release_extraction_only_translates_substantive_changes_not_keyword_heavy_maintenance():
+    noise = (
+        "chore: update the computational design geometry algorithm implementation dependencies. "
+        "ci: improve the generative art blockchain shader Python research tool test matrix. "
+    )
+    feature = "Added wp.tile_load support for 3D arrays with 16-bit elements on the GPU."
+    fix = "Fix p5.Framebuffer texture dimensions when the pixel density is set to 2."
+    excerpt = f"{noise}{feature} {fix}"
+    assert extract_sentences("Repository release", excerpt, kind="release") == [feature, fix]
+
+
+def test_local_release_translation_receives_only_real_changes_after_quality_selection():
+    title = "Mesh release 1.2.3"
+    feature = "Added GPU support for the mesh query algorithm with 16-bit geometry buffers."
+    noise = "chore: update the computational design algorithm implementation dependencies."
+    protected_title, _ = protect_release_identifiers(title)
+    protected_feature, _ = protect_release_identifiers(feature)
+    translator = FakeTranslator(
+        {
+            protected_title: "메시 도구 __CDREF_A__ 출시",
+            protected_feature: "16비트 기하 버퍼를 사용하는 메시 질의 알고리즘에 __CDREF_A__ 지원을 추가했습니다.",
+        }
+    )
+    summary = asyncio.run(
+        LocalSummarizer(translator=translator).summarize(item(title, f"{noise} {feature}", kind="release"))
+    )
+    assert translator.calls == [protected_title, protected_feature]
+    assert summary.bullets == ("16비트 기하 버퍼를 사용하는 메시 질의 알고리즘에 GPU 지원을 추가했습니다.",)
+
+
+def test_release_identifier_protection_restores_exact_api_names_and_package_versions():
+    source = (
+        "ArtBlocks/contracts @artblocks/contracts@1.4.0 ITransferHook wp.tile_load p5.Framebuffer FIELD_HOOK"
+    )
+    protected, mapping = protect_release_identifiers(source)
+    assert all(value not in protected for value in mapping.values())
+    assert len(mapping) == 6
+    assert restore_release_identifiers("코드 " + protected, mapping) == "코드 " + source
+
+
+@pytest.mark.parametrize(
+    "translation",
+    [
+        "IWorkbook 인터페이스를 추가했습니다.",
+        "__CDREF_A__ __CDREF_A__ 인터페이스를 추가했습니다.",
+        "__CDREF_B__ 인터페이스를 추가했습니다.",
+        "__CDREF_A__ 및 IWorkbook 인터페이스를 추가했습니다.",
+    ],
+)
+def test_release_identifier_mutation_missing_duplicates_and_invention_are_blocked(translation):
+    _, mapping = protect_release_identifiers("Added ITransferHook interface.")
+    with pytest.raises(SummaryError, match="식별자"):
+        restore_release_identifiers(translation, mapping)
+
+
+def test_release_length_limit_cannot_cut_an_api_identifier_in_half():
+    with pytest.raises(SummaryError, match="식별자"):
+        _bounded_korean("인터페이스 " + "OwnerHistoryTransferHook", 20, protect_identifiers=True)
+
+
 def test_extraction_prefers_self_contained_sentences_over_missing_pronoun_context():
     dangling = "His research combines generative art and computational design on the blockchain."
     fact = "The Mesh toolkit creates parametric surfaces from hand-drawn curves."
@@ -350,9 +420,9 @@ def test_authorial_pronouns_are_attributed_only_in_papers_and_when_present_in_so
     assert _terms_in_korean("We propose a method.", "우리는 방법을 제안합니다.", kind="paper") == (
         "연구진은 방법을 제안합니다."
     )
-    assert _terms_in_korean("Our method improves accuracy.", "우리의 방법은 정확도를 높입니다.", kind="paper") == (
-        "연구진의 방법은 정확도를 높입니다."
-    )
+    assert _terms_in_korean(
+        "Our method improves accuracy.", "우리의 방법은 정확도를 높입니다.", kind="paper"
+    ) == ("연구진의 방법은 정확도를 높입니다.")
     assert _terms_in_korean("We opened the studio.", "우리는 스튜디오를 열었습니다.") == (
         "우리는 스튜디오를 열었습니다."
     )
@@ -370,7 +440,9 @@ def test_local_paper_bullets_allow_full_technical_sentence_without_widening_othe
     )
     assert 120 < len(fact) <= 160
     summary = asyncio.run(
-        LocalSummarizer(translator=FakeTranslator({})).summarize(item("기하학 프레임워크 연구", fact, kind=kind))
+        LocalSummarizer(translator=FakeTranslator({})).summarize(
+            item("기하학 프레임워크 연구", fact, kind=kind)
+        )
     )
     if kind == "paper":
         assert summary.bullets == (fact,)

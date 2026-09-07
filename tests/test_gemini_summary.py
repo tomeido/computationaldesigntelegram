@@ -95,6 +95,44 @@ def test_korean_original_requires_no_api_request():
     assert "Gemini" not in summary.evidence
 
 
+def test_release_masks_code_before_translation_and_restores_exact_names_afterwards():
+    title = "ArtBlocks/tool release 1.4.0"
+    fact = "Added ITransferHook interface support for onchain transfer hooks and GPU mesh rendering."
+
+    def handler(request):
+        payload = json.loads(request.content)
+        texts = json.loads(payload["contents"][0]["parts"][0]["text"])["texts"]
+        assert "ITransferHook" not in " ".join(texts)
+        assert "ArtBlocks/tool" not in " ".join(texts)
+        assert texts[0] == "__CDREF_A__ release __CDREF_B__"
+        assert "Copy every such token exactly once" in payload["systemInstruction"]["parts"][0]["text"]
+        return httpx.Response(
+            200,
+            json=result(
+                [
+                    "__CDREF_A__ __CDREF_B__ 출시",
+                    "__CDREF_A__ 인터페이스와 __CDREF_B__ 메시 렌더링을 온체인 전송 훅에 지원합니다.",
+                ]
+            ),
+        )
+
+    summary = run_summary(handler, item(title, fact, kind="release"))
+    assert summary.title == "ArtBlocks/tool 1.4.0 출시"
+    assert "ITransferHook" in summary.bullets[0]
+    assert "GPU" in summary.bullets[0]
+    assert "CDREF" not in str(summary)
+
+
+def test_release_model_cannot_replace_an_api_with_a_different_name():
+    title = "새로운 메시 도구"
+    fact = "Added ITransferHook interface support for onchain transfer hooks and mesh rendering."
+    with pytest.raises(SummaryError, match="식별자"):
+        run_summary(
+            lambda _: httpx.Response(200, json=result(["IWorkbook 인터페이스를 지원합니다."])),
+            item(title, fact, kind="release"),
+        )
+
+
 def test_mixed_language_sends_only_foreign_text():
     def handler(request):
         payload = json.loads(request.content)
@@ -252,7 +290,9 @@ def test_paper_geometry_and_author_attribution_are_corrected_without_inventing_n
 
     summary = run_summary(handler, item(title, fact, kind="paper"))
     assert summary.title == "실제 환경의 모델"
-    assert summary.bullets == ("연구진은 비다양체 및 밀폐되지 않은 메시를 위한 계산 프레임워크를 제안합니다.",)
+    assert summary.bullets == (
+        "연구진은 비다양체 및 밀폐되지 않은 메시를 위한 계산 프레임워크를 제안합니다.",
+    )
 
 
 @pytest.mark.parametrize("kind", ["paper", "news", "funding", "showcase"])

@@ -18,6 +18,7 @@ import feedparser
 import httpx
 
 from compdesign_bot.models import ARTICLE_KINDS, Article
+from compdesign_bot.resources import source_links
 
 MAX_FEED_BYTES = 2 * 1024 * 1024
 MAX_ENTRIES_PER_SOURCE = 80
@@ -128,7 +129,7 @@ def load_sources(path: Path) -> list[Source]:
         if not isinstance(source.topic, str):
             raise ValueError(f"Source {index} topic must be text")  # noqa: TRY004 - invalid JSON data
         if not isinstance(source.kind, str) or source.kind not in ARTICLE_KINDS:
-            raise ValueError(f"Source {index} kind must be news, paper, funding or showcase")
+            raise ValueError(f"Source {index} kind must be news, paper, funding, showcase or release")
         if isinstance(source.weight, bool) or not isinstance(source.weight, (int, float)):
             raise ValueError(f"Source {index} weight must be a finite nonnegative number")  # noqa: TRY004
         if not math.isfinite(source.weight) or source.weight < 0:
@@ -182,6 +183,12 @@ def _parse_feed(content: bytes, source: Source, base_url: str) -> FetchReport:
             # Search RSS descriptions repeat the headline; they are not article text.
             discovery = source.discovery or urlsplit(base_url).hostname == "news.google.com"
             summary = "" if discovery else _plain_text(str(raw_summary), MAX_SUMMARY_CHARS)
+            # arXiv authors often put project/code URLs in their comments rather
+            # than the abstract. Preserve those explicit links, without treating
+            # author comments as research findings or verified publication data.
+            resource_content = str(raw_summary)
+            if source.kind == "paper" and isinstance(entry.get("arxiv_comment"), str):
+                resource_content += "\n" + entry["arxiv_comment"]
             report.articles.append(
                 Article(
                     title=title,
@@ -190,6 +197,7 @@ def _parse_feed(content: bytes, source: Source, base_url: str) -> FetchReport:
                     summary=summary,
                     published_at=_published_at(entry),
                     kind=source.kind,
+                    links=() if discovery else source_links(resource_content, url),
                 )
             )
         except (ValueError, TypeError, AttributeError):

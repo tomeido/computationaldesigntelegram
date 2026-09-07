@@ -44,7 +44,7 @@ def test_load_sources_validates_configuration(tmp_path):
 
 def test_content_kind_is_validated_and_preserved(tmp_path):
     path = tmp_path / "sources.json"
-    for kind in ("paper", "funding", "showcase"):
+    for kind in ("paper", "funding", "showcase", "release"):
         path.write_text(json.dumps([{"name": "Example", "url": "https://example.com/rss", "kind": kind}]))
         sources = load_sources(path)
         report = run(sources, lambda request: httpx.Response(200, content=rss(item())))
@@ -186,3 +186,48 @@ def test_rss_content_is_used_instead_of_short_marketing_description():
     )
     assert "on-chain generative art" in report.articles[0].summary
     assert "Read our latest interview" not in report.articles[0].summary
+
+
+def test_source_code_and_demo_links_survive_html_text_extraction():
+    body = rss(item(description=(
+        '<p>The new geometry tool has <a href="https://github.com/lab/geometry">source code</a> '
+        'and a <a href="https://geometry.org/demo">live demo</a>.</p>'
+    )))
+    report = run(
+        [Source("Research", "https://example.com/feed", kind="paper")],
+        lambda request: httpx.Response(200, content=body),
+    )
+    article = report.articles[0]
+    assert "The new geometry tool has source code and a live demo." in article.summary
+    assert [(link.label, link.url) for link in article.links] == [
+        ("코드 (원문 링크)", "https://github.com/lab/geometry"),
+        ("데모 (원문 링크)", "https://geometry.org/demo"),
+    ]
+
+
+def test_search_discovery_links_are_not_treated_as_original_source_resources():
+    body = rss(item(description='<a href="https://github.com/lab/repo">Source code</a>'))
+    report = run(
+        [Source("Discovery", "https://example.com/search", discovery=True)],
+        lambda request: httpx.Response(200, content=body),
+    )
+    assert report.articles[0].summary == ""
+    assert report.articles[0].links == ()
+
+
+def test_arxiv_comments_supply_explicit_code_links_but_not_translation_text():
+    body = b'''<feed xmlns="http://www.w3.org/2005/Atom" xmlns:arxiv="http://arxiv.org/schemas/atom">
+    <title>arXiv</title><id>urn:feed</id><updated>2026-09-07T10:00:00Z</updated>
+    <entry><id>urn:paper</id><title>A geometry method</title>
+    <link href="https://arxiv.org/abs/2609.12345"/>
+    <published>2026-09-07T10:00:00Z</published><updated>2026-09-07T10:00:00Z</updated>
+    <summary>We introduce a geometry optimization method.</summary>
+    <arxiv:comment>12 pages. Code: https://github.com/lab/geometry. Project page: https://geometry.org/</arxiv:comment>
+    </entry></feed>'''
+    report = run(
+        [Source("arXiv", "https://export.arxiv.org/api/query", kind="paper")],
+        lambda request: httpx.Response(200, content=body),
+    )
+    article = report.articles[0]
+    assert article.summary == "We introduce a geometry optimization method."
+    assert [link.url for link in article.links] == ["https://github.com/lab/geometry", "https://geometry.org/"]

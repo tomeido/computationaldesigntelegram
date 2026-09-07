@@ -16,7 +16,10 @@ from .local_summary import (
     _bounded_korean,
     _is_korean,
     _terms_in_korean,
+    bullet_limit,
     extract_sentences,
+    protect_release_identifiers,
+    restore_release_identifiers,
     validate_translation,
 )
 from .models import RankedArticle, Summary
@@ -44,6 +47,11 @@ _ACADEMIC_INSTRUCTION = (
     " These excerpts are from an academic paper. Render the authors' we as 연구진은 "
     "and our as 연구진의 so the channel does not appear to be the author. "
     "Do not invent author names."
+)
+_RELEASE_INSTRUCTION = (
+    " These are software release notes. Each __CDREF_LETTERS__ token is an immutable code identifier. "
+    "Copy every such token exactly once, without translating, changing, expanding or explaining it. "
+    "Translate only the surrounding natural-language text into Korean."
 )
 
 
@@ -131,7 +139,7 @@ class GeminiSummarizer:
         self.namespace = cache_namespace(model)
 
     async def _translate(self, texts: list[str], *, kind: str = "news") -> list[str]:
-        if any(len(text) > 320 for text in texts):
+        if any(len(text) > (900 if kind == "release" else 320) for text in texts):
             raise SummaryError("번역할 제목이나 문장이 너무 깁니다. 이번 기사는 발행하지 않습니다.")
         thinking = (
             {"thinkingLevel": "MINIMAL"} if self.model.startswith("gemini-3") else {"thinkingBudget": 0}
@@ -139,7 +147,16 @@ class GeminiSummarizer:
         payload = {
             "systemInstruction": {
                 "parts": [
-                    {"text": _SYSTEM_INSTRUCTION + (_ACADEMIC_INSTRUCTION if kind == "paper" else "")}
+                    {
+                        "text": _SYSTEM_INSTRUCTION
+                        + (
+                            _ACADEMIC_INSTRUCTION
+                            if kind == "paper"
+                            else _RELEASE_INSTRUCTION
+                            if kind == "release"
+                            else ""
+                        )
+                    }
                 ]
             },
             "contents": [{"role": "user", "parts": [{"text": json.dumps({"texts": texts})}]}],
@@ -189,8 +206,16 @@ class GeminiSummarizer:
         foreign_texts = [text for text in source_texts if not _is_korean(text)]
         translated = {text: text for text in source_texts if _is_korean(text)}
         if foreign_texts:
-            results = await self._translate(foreign_texts, kind=article.kind)
-            for source, result in zip(foreign_texts, results, strict=True):
+            if article.kind == "release" and any(len(text) > 320 for text in foreign_texts):
+                raise SummaryError("번역할 제목이나 문장이 너무 깁니다. 이번 기사는 발행하지 않습니다.")
+            protected = [
+                protect_release_identifiers(text) if article.kind == "release" else (text, {})
+                for text in foreign_texts
+            ]
+            results = await self._translate([text for text, _ in protected], kind=article.kind)
+            for source, result, (_, mapping) in zip(foreign_texts, results, protected, strict=True):
+                if article.kind == "release":
+                    result = restore_release_identifiers(result, mapping)
                 result = _terms_in_korean(source, result, kind=article.kind)
                 validate_translation(source, result)
                 translated[source] = result
@@ -199,8 +224,13 @@ class GeminiSummarizer:
         evidence = "RSS 발췌" if sentences else "제목만 확인 · 원문 확인 필요"
         evidence += "·기계번역 (Gemini)" if foreign_texts else " (한국어 원문)"
         return Summary(
-            title=_bounded_korean(title, 65),
-            bullets=tuple(_bounded_korean(text, 160 if article.kind == "paper" else 120) for text in facts),
+            title=_bounded_korean(title, 65, protect_identifiers=article.kind == "release"),
+            bullets=tuple(
+                _bounded_korean(
+                    text, bullet_limit(article.kind), protect_identifiers=article.kind == "release"
+                )
+                for text in facts
+            ),
             why="세부 조건과 정확한 표현은 원문을 확인하세요.",
             evidence=evidence,
         )

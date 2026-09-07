@@ -5,7 +5,7 @@ from html.parser import HTMLParser
 import pytest
 
 from compdesign_bot.formatting import render_post
-from compdesign_bot.models import Article, RankedArticle, Summary
+from compdesign_bot.models import Article, ArticleLink, RankedArticle, Summary
 
 
 def item(*, excerpt="Research excerpt.", url="https://example.com/article"):
@@ -69,3 +69,28 @@ def test_arxiv_label_does_not_infer_peer_review_status():
     assert "게재 여부" in post
     assert "미심사" not in post
     assert "심사 완료" not in post
+
+
+def test_release_displays_source_links_license_and_separate_curator_note():
+    ranked = item()
+    ranked = replace(ranked, article=replace(
+        ranked.article, kind="release", curator_note="온체인 <작품> 제작", license="MIT",
+        links=(ArticleLink("코드 & 예제", "https://github.com/owner/repo"),
+               ArticleLink("위험", "javascript:alert(1)"),
+               ArticleLink("중복", "https://github.com/owner/repo")),
+    ))
+    post = render_post(ranked, Summary("제목", ("변경 내용",), "의미", "RSS 발췌 · 번역"))
+    assert "GitHub 업데이트" in post and "#GitHub" in post
+    assert "활용: 온체인 &lt;작품&gt; 제작" in post
+    assert "저장소 라이선스 표기: MIT" in post
+    assert "공식 릴리스 발췌 · 번역" in post
+    assert post.count('href="https://github.com/owner/repo"') == 1
+    assert "코드 &amp; 예제" in post and "javascript:" not in post
+    assert "코드 실행과 환경 호환성은 직접 확인" in post
+
+
+def test_release_never_infers_license_from_public_visibility():
+    ranked = item()
+    ranked = replace(ranked, article=replace(ranked.article, kind="release"))
+    post = render_post(ranked, Summary("제목", ("변경 내용",), "의미", "근거"))
+    assert "저장소 라이선스 표기: 확인 필요" in post

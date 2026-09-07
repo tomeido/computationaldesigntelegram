@@ -8,10 +8,11 @@ from datetime import UTC, datetime
 import httpx
 
 from .config import Settings
-from .feeds import collect_articles, load_sources
+from .feeds import load_sources
 from .formatting import CHANNEL_DESCRIPTION, render_post
 from .models import Article, RankedArticle, Summary
-from .pipeline import run_digest
+from .pipeline import collect_report, run_digest
+from .quality import assess_quality, select_quality
 from .ranking import rank_articles
 from .scheduler import serve
 from .storage import Store, job_lock
@@ -41,8 +42,9 @@ def demo():
 
 async def collect(settings: Settings, as_json: bool):
     async with httpx.AsyncClient(follow_redirects=False) as client:
-        report = await collect_articles(load_sources(settings.sources_file), client)
+        report = await collect_report(settings, client)
     ranked = rank_articles(report.articles, max_age_days=settings.max_age_days)
+    selected, rejected = select_quality(ranked)
     items = [
         {
             "priority": r.priority,
@@ -52,10 +54,13 @@ async def collect(settings: Settings, as_json: bool):
             "title": r.article.title,
             "url": r.article.url,
             "source": r.article.source,
+            "quality_reason": assess_quality(r.article).reason,
+            "links": [{"label": link.label, "url": link.url} for link in r.article.links],
+            "license": r.article.license,
             "published_at": r.article.published_at.isoformat() if r.article.published_at else None,
-            "evidence": "RSS 발췌" if r.article.summary else "제목만 확인",
+            "evidence": "공식 릴리스 발췌" if r.article.kind == "release" else "RSS 발췌",
         }
-        for r in ranked[: settings.max_candidates]
+        for r in selected[: settings.max_candidates]
     ]
     if as_json:
         print(
@@ -64,6 +69,12 @@ async def collect(settings: Settings, as_json: bool):
                     "collected_at": datetime.now(UTC).isoformat(),
                     "fetched": len(report.articles),
                     "ranked": len(ranked),
+                    "quality_passed": len(selected),
+                    "quality_rejected": len(rejected),
+                    "excluded": [
+                        {"title": item.article.title, "url": item.article.url, "reason": decision.reason}
+                        for item, decision in rejected[: settings.max_candidates]
+                    ],
                     "errors": report.errors,
                     "candidates": items,
                 },
@@ -72,13 +83,18 @@ async def collect(settings: Settings, as_json: bool):
             )
         )
     else:
-        print(f"수집 {len(report.articles)}건 / 관련 후보 {len(ranked)}건 (최근 {settings.max_age_days}일)")
+        print(
+            f"수집 {len(report.articles)}건 / 관련 후보 {len(ranked)}건 / "
+            f"품질 기준 통과 {len(selected)}건 (최근 {settings.max_age_days}일)"
+        )
         for item in items:
             print(
                 f"\n[{item['category']}] {item['title']}\n{item['source']} · {item['evidence']}\n{item['url']}"
             )
         for error in report.errors:
             print(f"피드 오류: {error}", file=sys.stderr)
+        for item, decision in rejected[: settings.max_candidates]:
+            print(f"제외: {item.article.title} — {decision.reason}")
     if not report.articles and report.errors:
         raise RuntimeError("피드를 수집하지 못했습니다.")
 
@@ -87,6 +103,10 @@ async def doctor(settings: Settings):
     settings.require_token()
     sources = load_sources(settings.sources_file)
     print(f"활성 소스: {sum(s.enabled for s in sources)}개")
+    if settings.repositories_file:
+        from .github_sources import load_repositories
+
+        print(f"관심 GitHub 저장소: {sum(r.enabled for r in load_repositories(settings.repositories_file))}개")
     print(f"예약: {', '.join(t.strftime('%H:%M') for t in settings.post_times)} ({settings.timezone})")
     async with httpx.AsyncClient() as client:
         bot = Telegram(client, settings.bot_token, settings.channel_id)
@@ -113,13 +133,14 @@ async def configure_bot(settings: Settings):
         "Web3·블록체인과 컴퓨테이셔널 디자인의 접점을 먼저 전합니다. "
         "온체인 생성 예술, AI 디자인 도구, 파라메트릭 디자인, 크리에이티브 코딩 소식을 "
         "논문·투자 및 지원 소식·작품과 실험까지 한국어 발췌·번역과 원문 링크로 확인하세요.\n\n"
-        "/latest 최신 브리핑\n/sources 정보 출처\n/help 이용 안내"
+        "/latest 최신 브리핑\n/tools 추천 GitHub 도구\n/sources 정보 출처\n/help 이용 안내"
     )
     commands = [
         {"command": command, "description": text}
         for command, text in (
             ("start", "컴퓨트 디자인 브리핑 시작"),
             ("latest", "최신 한국어 디자인 브리핑"),
+            ("tools", "추천 GitHub 도구와 활용법"),
             ("sources", "정보 출처 확인"),
             ("help", "이용 안내와 채널 연결 방법"),
         )
@@ -214,6 +235,7 @@ async def dispatch(args, settings: Settings):
                 print(post + "\n\n")
         print(
             f"수집 {result.fetched}건 / 후보 {result.ranked}건 / "
+            f"품질 제외 {result.quality_rejected}건 / "
             f"{'발행' if args.command == 'publish' else '요약'} {len(result.messages)}건"
         )
         if not result.messages and not result.failed:
@@ -249,7 +271,7 @@ def main():
     parser = argparse.ArgumentParser(description="Web3·AI 컴퓨테이셔널 디자인 한국어 브리핑")
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("demo", help="키 없이 발행 형식 예시 보기")
-    p = sub.add_parser("collect", help="RSS 수집·순위 확인 (AI 호출·발행 없음)")
+    p = sub.add_parser("collect", help="수집·품질 선별 이유 확인 (AI 호출·발행 없음)")
     p.add_argument("--json", action="store_true")
     sub.add_parser("preview", help="선택한 번역기로 한국어 발췌·번역 미리보기")
     sub.add_parser("publish", help="지금 채널에 실제 발행")

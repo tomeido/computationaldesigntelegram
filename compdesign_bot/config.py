@@ -34,6 +34,7 @@ class Settings:
     max_age_days: int = 7
     max_candidates: int = 15
     sources_file: Path = Path("config/sources.json")
+    repositories_file: Path | None = None
     database_path: Path = Path("data/bot.sqlite3")
 
     def __post_init__(self) -> None:
@@ -76,6 +77,11 @@ class Settings:
             max_age_days=_integer("MAX_AGE_DAYS", 7, 1, 30),
             max_candidates=_integer("MAX_CANDIDATES", 15, 1, 30),
             sources_file=Path(os.getenv("SOURCES_FILE", "config/sources.json")),
+            repositories_file=(
+                Path(os.getenv("REPOSITORIES_FILE", "config/repositories.json").strip())
+                if os.getenv("REPOSITORIES_FILE", "config/repositories.json").strip()
+                else None
+            ),
             database_path=Path(os.getenv("DATABASE_PATH", "data/bot.sqlite3")),
         )
 

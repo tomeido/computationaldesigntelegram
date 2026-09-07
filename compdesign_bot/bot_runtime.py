@@ -20,7 +20,9 @@ import httpx
 
 from .config import Settings
 from .feeds import load_sources
+from .github_sources import load_repositories
 from .pipeline import run_digest
+from .resources import public_resource_url
 from .telegram import Telegram, TelegramError
 
 log = logging.getLogger(__name__)
@@ -158,6 +160,7 @@ class CommandHandler:
             "AI 디자인 소식과 관련 논문·투자 및 지원 소식·작품과 실험도 "
             "한국어 핵심과 원문 링크로 전합니다.\n\n"
             "/latest — 최신 브리핑 최대 3건\n"
+            "/tools — 추천 GitHub 도구와 활용법\n"
             "/sources — 수집 출처\n"
             "/help — 이용 안내\n\n"
             "최신 브리핑은 1시간 동안 함께 사용하며, 개인별 요청 간격은 1분입니다."
@@ -178,16 +181,43 @@ class CommandHandler:
 
     def _sources(self) -> str:
         text = "<b>브리핑 수집 출처</b>\nWeb3·블록체인 디자인 소식을 우선 선별합니다.\n"
-        for source in load_sources(self.settings.sources_file):
-            if not source.enabled:
-                continue
-            line = f"\n• {escape(source.name[:100])}"
+        lines = [f"\n• {escape(s.name[:100])}" for s in load_sources(self.settings.sources_file) if s.enabled]
+        if self.settings.repositories_file:
+            repositories = load_repositories(self.settings.repositories_file)
+            lines += ["\n\nGitHub 공식 릴리스 (/tools에서 활용법 확인)"]
+            lines += [f"\n• {escape(r.full_name)}" for r in repositories if r.enabled]
+        for line in lines:
             # Telegram uses UTF-16 code units; count escaped markup conservatively.
             if len((text + line).encode("utf-16-le")) // 2 > 3900:
                 text += "\n• 그 밖의 설정된 출처"
                 break
             text += line
         return text
+
+    def _tools(self) -> list[str]:
+        if not self.settings.repositories_file:
+            return ["아직 추천 GitHub 목록이 설정되지 않았습니다."]
+        messages = []
+        text = "<b>추천 GitHub 도구</b>\n오래 두고 살펴볼 도구와 활용법입니다.\n"
+        for repo in load_repositories(self.settings.repositories_file):
+            if not repo.enabled:
+                continue
+            card = f"\n<b>{escape(repo.full_name)}</b>\n{escape(repo.why[:180])}\n"
+            links = []
+            for label, candidate in (("GitHub", repo.url), ("문서", repo.docs_url), ("예제", repo.example_url)):
+                url = public_resource_url(candidate)
+                if url:
+                    link = f'<a href="{escape(url, quote=True)}">{label}</a>'
+                    if len((card + " · ".join(links + [link])).encode("utf-16-le")) // 2 <= 3000:
+                        links.append(link)
+            card += " · ".join(links) + "\n"
+            if len((text + card).encode("utf-16-le")) // 2 > 3600:
+                messages.append(text)
+                text = "<b>추천 GitHub 도구 · 계속</b>\n"
+            text += card
+        text += "\n실행 환경과 라이선스는 저장소에서 확인하세요. 코드 실행을 검증한 목록은 아닙니다."
+        messages.append(text)
+        return messages
 
     async def _latest(self, chat_id: int) -> None:
         now = time.monotonic()
@@ -253,6 +283,9 @@ class CommandHandler:
                 await self._reply(chat_id, self._welcome())
             elif command == "sources":
                 await self._reply(chat_id, self._sources())
+            elif command == "tools":
+                for text in self._tools():
+                    await self._reply(chat_id, text)
             elif command == "latest":
                 await self._latest(chat_id)
         except TelegramError:

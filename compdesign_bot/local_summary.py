@@ -19,6 +19,7 @@ import threading
 import urllib.error
 import urllib.request
 import zipfile
+from collections import Counter
 from pathlib import Path
 from typing import Protocol
 
@@ -26,6 +27,7 @@ import httpx
 
 from .errors import SummaryError
 from .models import RankedArticle, Summary
+from .quality import select_release_changes
 
 DEFAULT_MODEL_PATH = Path("data/models/m2m100")
 MODEL_URL = "https://data.argosopentech.com/argospm/v2/translate-fairseq_m2m_100_418M.argosmodel"
@@ -47,6 +49,68 @@ MODEL_METADATA = {
 }
 CACHE_NAMESPACE = "local-m2m100-en-ko-guarded-v5"
 _HANGUL = re.compile(r"[가-힣]")
+_CODE_TOKEN = re.compile(
+    r"(?<![A-Za-z0-9_])(?:@?[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(?:@[0-9][A-Za-z0-9_.-]*)?"
+    r"|v?\d+(?:\.\d+){1,3}(?:-[A-Za-z0-9.-]+)?"
+    r"|[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*)(?![A-Za-z0-9_])"
+)
+
+
+def _is_code_token(value: str) -> bool:
+    return bool(
+        "/" in value
+        or "." in value
+        or re.search(r"[a-z][A-Z]|[A-Z]{2,}[a-z]", value)
+        or re.fullmatch(r"[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+|[A-Z]{2,}[0-9]*|[A-Z]+[0-9]+", value)
+    )
+
+
+def protect_release_identifiers(text: str) -> tuple[str, dict[str, str]]:
+    """Mask only identifiers present in this source; placeholders carry no facts."""
+    if "CDREF" in text:
+        raise SummaryError("릴리스 원문에 예약된 보호 토큰이 있어 발행하지 않습니다.")
+    mapping: dict[str, str] = {}
+
+    def protect(match: re.Match[str]) -> str:
+        value = match.group()
+        if not _is_code_token(value):
+            return value
+        # Letter-only indices avoid introducing numbers that could look like
+        # new version/amount claims before restoration.
+        index = len(mapping)
+        letters = ""
+        while True:
+            letters = chr(65 + index % 26) + letters
+            index = index // 26 - 1
+            if index < 0:
+                break
+        token = f"__CDREF_{letters}__"
+        mapping[token] = value
+        return token
+
+    return _CODE_TOKEN.sub(protect, text), mapping
+
+
+def restore_release_identifiers(translation: str, mapping: dict[str, str]) -> str:
+    """Require every exact token once, then restore the source identifier only."""
+    if any(translation.count(token) != 1 for token in mapping):
+        raise SummaryError("릴리스 코드 식별자 보호 토큰이 누락·변조되어 발행하지 않습니다.")
+    for token, original in mapping.items():
+        translation = translation.replace(token, original)
+    if "CDREF" in translation:
+        raise SummaryError("릴리스 코드 식별자 보호 토큰을 확인하지 못했습니다.")
+    actual = Counter(
+        match.group() for match in _CODE_TOKEN.finditer(translation) if _is_code_token(match.group())
+    )
+    if actual != Counter(mapping.values()):
+        raise SummaryError("릴리스 코드 식별자가 원문과 달라 발행하지 않습니다.")
+    return translation
+
+
+def bullet_limit(kind: str) -> int:
+    return 260 if kind == "release" else 160 if kind == "paper" else 120
+
+
 _TOPICS = re.compile(
     r"computational|generative|algorithm|parametric|procedural|creative coding|"
     r"geometry|blockchain|on.chain|smart contract|web3|\bAI\b|machine learning|"
@@ -249,9 +313,14 @@ def _is_korean(text: str) -> bool:
     return hangul >= 2 and hangul >= latin * 0.3
 
 
-def _bounded_korean(text: str, limit: int) -> str:
+def _bounded_korean(text: str, limit: int, *, protect_identifiers: bool = False) -> str:
     text = " ".join(text.split())
     if len(text) > limit:
+        if protect_identifiers and any(
+            match.start() < limit - 1 < match.end() and _is_code_token(match.group())
+            for match in _CODE_TOKEN.finditer(text)
+        ):
+            raise SummaryError("릴리스 길이 제한으로 코드 식별자가 잘려 발행하지 않습니다.")
         text = text[: limit - 1].rstrip() + "…"
     if not _HANGUL.search(text):
         raise SummaryError("한국어 번역 결과를 확인하지 못했습니다. 이번 기사는 발행하지 않습니다.")
@@ -353,6 +422,8 @@ def _terms_in_korean(source: str, translation: str, *, kind: str = "news") -> st
     for source_pattern, translated_pattern, replacement in glossary:
         if re.search(source_pattern, source, re.IGNORECASE):
             translation = re.sub(translated_pattern, replacement, translation, flags=re.IGNORECASE)
+    if kind == "release" and re.match(r"Core\s+v?\d+\.", source, re.IGNORECASE):
+        translation = re.sub(r"^핵심(?=\s+v?\d+\.)", "코어", translation)
     if kind == "paper":
         if re.search(r"\bwe\b", source, re.IGNORECASE):
             translation = re.sub(r"우리는|저희는", "연구진은", translation)
@@ -367,13 +438,19 @@ def extract_sentences(title: str, excerpt: str, kind: str = "news") -> list[str]
 
     Papers pair a contribution with evidence/limitations, funding pairs an
     announcement with amounts/terms, and showcases pair technique with a demo.
+    Releases use only the useful changelog sentences accepted by the quality gate.
     Missing details are never inferred, and selected text stays in source order.
     """
     normalized_title = re.sub(r"\W+", "", title).casefold()
     candidates: list[tuple[int, str, int, bool, bool]] = []
     seen: set[str] = set()
     signals = _KIND_SIGNALS.get(kind)
-    for index, sentence in enumerate(re.split(r"(?<=[.!?。！？])\s+|[\r\n]+", excerpt[:6000])):
+    source_sentences = (
+        select_release_changes(excerpt)
+        if kind == "release"
+        else re.split(r"(?<=[.!?。！？])\s+|[\r\n]+", excerpt[:6000])
+    )
+    for index, sentence in enumerate(source_sentences):
         sentence = " ".join(sentence.split())
         normalized = re.sub(r"\W+", "", sentence).casefold()
         if (
@@ -441,7 +518,13 @@ class LocalSummarizer:
                 if _is_korean(text):
                     translated[text] = text
                 else:
-                    result = _terms_in_korean(text, self.translator.translate(text), kind=article.kind)
+                    protected, mapping = (
+                        protect_release_identifiers(text) if article.kind == "release" else (text, {})
+                    )
+                    result = self.translator.translate(protected)
+                    if article.kind == "release":
+                        result = restore_release_identifiers(result, mapping)
+                    result = _terms_in_korean(text, result, kind=article.kind)
                     try:
                         validate_translation(text, result)
                     except SummaryError:
@@ -462,8 +545,13 @@ class LocalSummarizer:
         else:
             evidence += " (한국어 원문)"
         return Summary(
-            title=_bounded_korean(texts[0], 65),
-            bullets=tuple(_bounded_korean(text, 160 if article.kind == "paper" else 120) for text in texts[1:]),
+            title=_bounded_korean(texts[0], 65, protect_identifiers=article.kind == "release"),
+            bullets=tuple(
+                _bounded_korean(
+                    text, bullet_limit(article.kind), protect_identifiers=article.kind == "release"
+                )
+                for text in texts[1:]
+            ),
             why="세부 조건과 정확한 표현은 원문을 확인하세요.",
             evidence=evidence,
         )

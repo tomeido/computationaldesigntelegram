@@ -1,6 +1,7 @@
 import asyncio
 import json
 from collections import Counter
+from dataclasses import replace
 from datetime import UTC, datetime
 from types import SimpleNamespace
 
@@ -71,7 +72,8 @@ def make_article(index=1):
         f"Web3 generative art research {index}",
         f"https://example.com/{index}",
         "Example",
-        "Open source computational design tool.",
+        "The open-source tool generates on-chain generative art by combining seeded geometry "
+        "with procedural shaders that render reproducible compositions in the browser.",
         datetime.now(UTC),
     )
 
@@ -253,3 +255,56 @@ def test_preview_does_not_send_or_mark_articles_and_reuses_summaries(monkeypatch
     after = asyncio.run(pipeline.run_digest(settings))
     assert after.messages == []
     assert len(delivered) == 3
+
+
+def test_only_articles_with_substantive_source_evidence_are_translated_and_sent(monkeypatch, tmp_path):
+    translated, delivered = [], []
+    articles = [
+        replace(make_article(1), summary=""),
+        replace(
+            make_article(2),
+            summary="An exciting generative art announcement for artists and developers. "
+            "More details about this creative project will be available soon.",
+        ),
+        make_article(3),
+    ]
+
+    def send(_request, payload):
+        delivered.append(payload["text"])
+        return httpx.Response(200, json={"ok": True, "result": {"message_id": 456}})
+
+    async def collect(_sources, _client):
+        return SimpleNamespace(articles=articles, errors=[])
+
+    class RecordingSummary:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def summarize(self, item):
+            translated.append(item.article.url)
+            return Summary(
+                "재현 가능한 온체인 생성예술 도구",
+                ("시드 기반 기하와 프로시저럴 셰이더를 사용합니다.",),
+                "브라우저에서 생성예술을 구현하는 예제입니다.",
+                "본문 발췌·기계번역",
+            )
+
+    settings = configure_pipeline(monkeypatch, tmp_path, send)
+    monkeypatch.setattr(pipeline, "collect_articles", collect)
+    monkeypatch.setattr(pipeline, "LocalSummarizer", RecordingSummary)
+
+    result = asyncio.run(pipeline.run_digest(settings, publish=True))
+
+    assert result.quality_rejected == 2
+    assert result.posted == 1
+    assert translated == [articles[2].url]
+    assert delivered == result.messages
+    assert articles[2].url in delivered[0]
+    store = Store(settings.database_path)
+    try:
+        assert store.status_counts() == {"sent": 1}
+        assert not store.seen(articles[0], "-100123")
+        assert not store.seen(articles[1], "-100123")
+        assert store.seen(articles[2], "-100123")
+    finally:
+        store.close()

@@ -1,7 +1,13 @@
 from dataclasses import dataclass
 from datetime import datetime
 
-ARTICLE_KINDS = frozenset({"news", "paper", "funding", "showcase"})
+ARTICLE_KINDS = frozenset({"news", "paper", "funding", "showcase", "release"})
+
+
+@dataclass(frozen=True)
+class ArticleLink:
+    label: str
+    url: str
 
 
 @dataclass(frozen=True)
@@ -12,6 +18,10 @@ class Article:
     summary: str
     published_at: datetime | None
     kind: str = "news"
+    links: tuple[ArticleLink, ...] = ()
+    license: str = ""
+    topic_context: str = ""
+    curator_note: str = ""
 
 
 @dataclass(frozen=True)

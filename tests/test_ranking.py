@@ -68,7 +68,7 @@ class RankingTests(unittest.TestCase):
         item = article("Web3에서 AI로 구현하는 파라메트릭 디자인")
         ranked = rank_articles([item], now=NOW)
         self.assertEqual(ranked[0].priority, 1)
-        self.assertGreater(ranked[0].score, 50)
+        self.assertLess(ranked[0].score, 25)
 
     def test_dates_must_be_known_recent_and_plausible(self):
         unknown = Article("Unknown generative art", "https://example.com/unknown", "Example", "", None)
@@ -298,6 +298,56 @@ class RankingTests(unittest.TestCase):
             article("An AI rigging investigation of an election result", kind="paper"),
         ]
         self.assertEqual(rank_articles(unrelated, now=NOW), [])
+
+    def test_incidental_nft_biography_does_not_promote_ai_design_to_web3(self):
+        item = article(
+            "Serpentine fellow investigates AI and computational design",
+            summary=(
+                "The research uses neural networks to explore algorithmic design systems. "
+                "The fellow previously worked at an NFT marketplace and a blockchain startup."
+            ),
+        )
+        ranked = rank_articles([item], now=NOW)
+        self.assertEqual(ranked[0].priority, 2)
+
+    def test_a_source_sentence_can_establish_actual_web3_design_connection(self):
+        item = article(
+            "A new way to preserve artworks",
+            summary=(
+                "The project stores generative art code and its assets onchain for reproducible rendering. "
+                "Its JavaScript repository includes an implementation and a demo."
+            ),
+        )
+        self.assertEqual(rank_articles([item], now=NOW)[0].priority, 1)
+
+    def test_practical_web3_implementation_can_outweigh_generic_ai_keyword(self):
+        implementation = article(
+            "Onchain generative art algorithm and open source implementation",
+            summary="The repository includes documentation and a tutorial for creative coding.",
+            age=timedelta(days=3),
+        )
+        generic_ai = article("AI onchain generative art", age=timedelta(minutes=1))
+        ranked = rank_articles([generic_ai, implementation], now=NOW)
+        self.assertEqual(ranked[0].article, implementation)
+        self.assertEqual([item.priority for item in ranked], [1, 1])
+
+    def test_curated_repository_context_establishes_release_topic(self):
+        release = Article(
+            "fxhash/onchfs · v0.3.0", "https://github.com/fxhash/onchfs/releases/tag/v0.3.0",
+            "GitHub · fxhash/onchfs", "Adds a resolver for loading file storage assets from a local gateway.",
+            NOW, kind="release", topic_context="Web3 onchain generative art preservation",
+        )
+        ranked = rank_articles([release], now=NOW)
+        self.assertEqual(ranked[0].priority, 1)
+        self.assertEqual(ranked[0].article.kind, "release")
+
+    def test_news_cannot_claim_a_topic_through_release_metadata(self):
+        unrelated = Article(
+            "New office in Berlin", "https://example.com/office", "Example",
+            "The company opens a new workspace in Berlin.", NOW,
+            topic_context="Web3 onchain generative art preservation",
+        )
+        self.assertEqual(rank_articles([unrelated], now=NOW), [])
 
 
 if __name__ == "__main__":

@@ -19,8 +19,11 @@ def identity(article: Article) -> tuple[str, str]:
 
 
 def cache_key(article: Article, model: str) -> str:
+    # Release translations preserve code identifiers. Earlier preview entries
+    # must not bypass that validation; existing news translations remain reusable.
+    version = "v4-release-identifiers" if article.kind == "release" else "v2"
     raw = json.dumps(
-        ["v2", model, article.kind, article.title, article.summary, article.source], ensure_ascii=False
+        [version, model, article.kind, article.title, article.summary, article.source], ensure_ascii=False
     )
     return hashlib.sha256(raw.encode()).hexdigest()
 

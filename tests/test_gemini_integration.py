@@ -11,6 +11,7 @@ from compdesign_bot.config import Settings
 from compdesign_bot.errors import SummaryError
 from compdesign_bot.gemini_summary import GeminiUnavailable
 from compdesign_bot.models import Article, RankedArticle, Summary
+from compdesign_bot.ranking import rank_articles
 from compdesign_bot.storage import Store
 
 KEY = "private-gemini-key-for-tests"
@@ -93,7 +94,8 @@ def configure_digest(monkeypatch, tmp_path):
             f"Computational design research {index}",
             f"https://example.com/research/{index}",
             "Research",
-            f"An open-source generative design tool explores technique {index}.",
+            "The open-source generative design tool uses constraint optimization to generate "
+            f"printable mesh structures for technique {index}, with adjustable thickness and support angles.",
             datetime.now(UTC),
         )
         for index in range(1, 4)
@@ -245,3 +247,29 @@ def test_switching_translation_provider_keeps_existing_delivery_history(monkeypa
         assert store.seen(articles[0], settings.channel_id)
     finally:
         store.close()
+
+
+@pytest.mark.parametrize("provider", ["gemini", "local"])
+def test_quality_rejections_never_reach_translation_but_substantive_articles_do(
+    monkeypatch, tmp_path, provider,
+):
+    settings, articles, calls, _failures = configure_digest(monkeypatch, tmp_path)
+    settings = replace(settings, translation_provider=provider)
+    articles[0] = replace(articles[0], summary="")
+    articles[1] = replace(
+        articles[1],
+        summary="A computational design announcement for artists, researchers and developers. "
+        "More exciting information about this creative initiative will be available soon.",
+    )
+    # Exercise the real relevance and evidence checks before the fake translator.
+    monkeypatch.setattr(pipeline, "rank_articles", rank_articles)
+
+    result = asyncio.run(pipeline.run_digest(settings))
+
+    assert result.fetched == result.ranked == 3
+    assert result.quality_rejected == 2
+    assert result.failed == 0
+    assert len(result.messages) == 1
+    assert [(used_provider, url) for used_provider, _model, url in calls] == [
+        (provider, articles[2].url)
+    ]

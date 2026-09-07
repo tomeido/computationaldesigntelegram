@@ -1,5 +1,6 @@
 import asyncio
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -16,6 +17,7 @@ from compdesign_bot.bot_runtime import (
     write_offset,
 )
 from compdesign_bot.config import Settings
+from compdesign_bot.github_sources import Repository
 from compdesign_bot.telegram import DeliveryUncertain
 
 
@@ -162,6 +164,58 @@ def test_only_valid_public_channel_names_become_links():
     assert 'href="https://t.me/our_channel"' in handler._welcome()
     handler = CommandHandler(Settings(channel_id='@bad\" onclick="evil'), FakeTelegram(), "our_bot")
     assert 'href=' not in handler._welcome()
+
+
+def test_tools_uses_curated_catalog_offline_and_only_replies_privately(monkeypatch):
+    telegram = FakeTelegram()
+    handler = CommandHandler(
+        Settings(repositories_file=Path("catalog.json")), telegram, "our_bot"
+    )
+    monkeypatch.setattr(bot_runtime, "load_repositories", lambda _: [
+        Repository("processing", "p5.js", "<작품> & 셰이더 예제", "creative coding",
+                   "https://p5js.org/reference/", "https://p5js.org/examples/"),
+        Repository("hidden", "repo", "숨김 도구", "design", enabled=False),
+    ])
+
+    async def forbidden(*args, **kwargs):
+        pytest.fail("static tools catalog must not collect or translate news")
+
+    monkeypatch.setattr(bot_runtime, "run_digest", forbidden)
+
+    async def run():
+        await handler.handle(command("/tools", chat_type="group"))
+        assert not telegram.calls
+        await handler.handle(command("/tools"))
+
+    asyncio.run(run())
+    assert len(telegram.calls) == 1
+    payload = telegram.calls[0][1]
+    text = payload["text"]
+    assert payload["chat_id"] == 42
+    assert 'href="https://github.com/processing/p5.js"' in text
+    assert 'href="https://p5js.org/examples/"' in text
+    assert "&lt;작품&gt; &amp;" in text and "hidden/repo" not in text
+    assert "코드 실행을 검증한 목록은 아닙니다" in text
+
+
+def test_tools_and_combined_sources_stay_within_telegram_limit(monkeypatch):
+    repos = [Repository(
+        "owner", f"repo{i}", "<😀&>" * 40, "design",
+        "https://example.com/?" + "x=&" * 300,
+        "https://example.com/?" + "y=&" * 300,
+    ) for i in range(10)]
+    monkeypatch.setattr(bot_runtime, "load_repositories", lambda _: repos)
+    monkeypatch.setattr(bot_runtime, "load_sources", lambda _: [
+        SimpleNamespace(name="<😀&>" * 30, enabled=True) for _ in range(40)
+    ])
+    handler = CommandHandler(
+        Settings(repositories_file=Path("catalog.json")), FakeTelegram(), "our_bot"
+    )
+    messages = handler._tools()
+    assert len(messages) > 1
+    assert all(len(message.encode("utf-16-le")) // 2 < 4000 for message in messages)
+    assert all(f"owner/repo{i}" in "".join(messages) for i in range(10))
+    assert len(handler._sources().encode("utf-16-le")) // 2 < 4000
 
 
 def test_atomic_offset_persistence_preserves_passive_channels_and_no_message_text(tmp_path):
