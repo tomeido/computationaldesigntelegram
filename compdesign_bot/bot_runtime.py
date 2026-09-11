@@ -23,7 +23,7 @@ from .feeds import load_sources
 from .github_sources import load_repositories
 from .pipeline import run_digest
 from .resources import public_resource_url
-from .telegram import Telegram, TelegramError
+from .telegram import Telegram, TelegramError, message_payload
 
 log = logging.getLogger(__name__)
 
@@ -146,10 +146,7 @@ class CommandHandler:
     async def _reply(self, chat_id: int, text: str) -> None:
         await self.telegram.call(
             "sendMessage",
-            chat_id=chat_id,
-            text=text,
-            parse_mode="HTML",
-            link_preview_options={"is_disabled": True},
+            **message_payload(chat_id, text),
         )
 
     def _welcome(self) -> str:

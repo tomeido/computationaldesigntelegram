@@ -10,13 +10,47 @@ import pytest
 
 from compdesign_bot import pipeline
 from compdesign_bot.config import Settings
-from compdesign_bot.models import Article, Summary
+from compdesign_bot.formatting import render_post
+from compdesign_bot.models import Article, ArticleLink, RankedArticle, Summary
 from compdesign_bot.storage import Store
-from compdesign_bot.telegram import DeliveryUncertain, Telegram, TelegramError
+from compdesign_bot.telegram import DeliveryUncertain, Telegram, TelegramError, message_payload
 
 
 async def no_sleep(_seconds):
     pass
+
+
+def test_source_button_uses_original_url_and_preserves_html_links():
+    url = "https://example.com/article?a=1&b=2#details"
+    article = replace(make_article(), url=url, links=(ArticleLink("코드", "https://github.com/a/b"),))
+    post = render_post(RankedArticle(article, 1, 10, "디자인"), Summary("제목", ("핵심",), "의미", "근거"))
+    calls = []
+
+    def handler(request):
+        calls.append(json.loads(request.content))
+        return httpx.Response(200, json={"ok": True, "result": {"message_id": 123}})
+
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            return await Telegram(client, "SECRET", "@channel").send(post)
+
+    assert asyncio.run(run()) == 123
+    payload = calls[0]
+    assert payload["text"] == post
+    assert payload["parse_mode"] == "HTML"
+    assert payload["reply_markup"] == {"inline_keyboard": [[{"text": "원문 보기", "url": url}]]}
+
+
+@pytest.mark.parametrize("text", [
+    "안녕하세요",
+    '<a href="https://example.com">다른 링크</a>',
+    '&lt;a href="https://example.com"&gt;원문 보기&lt;/a&gt;',
+    '<a href="javascript:alert(1)">원문 보기</a>',
+    '<a href="https://user:pass@example.com">원문 보기</a>',
+    '<a href="https://[invalid">원문 보기</a>',
+])
+def test_non_source_messages_have_no_source_button(text):
+    assert "reply_markup" not in message_payload(42, text)
 
 
 def test_rate_limit_retries_only_after_definite_rejection(monkeypatch):

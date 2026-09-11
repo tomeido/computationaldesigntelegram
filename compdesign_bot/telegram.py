@@ -1,6 +1,53 @@
 import asyncio
+from html.parser import HTMLParser
+from urllib.parse import urlsplit
 
 import httpx
+
+
+class _SourceLinkParser(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.href = None
+        self.label = []
+        self.url = None
+
+    def handle_starttag(self, tag, attrs):
+        if tag == "a":
+            self.href = dict(attrs).get("href")
+            self.label = []
+
+    def handle_data(self, data):
+        if self.href is not None:
+            self.label.append(data)
+
+    def handle_endtag(self, tag):
+        if tag == "a":
+            if "".join(self.label).strip() == "원문 보기" and self.href:
+                try:
+                    parts = urlsplit(self.href)
+                    if parts.scheme in {"http", "https"} and parts.hostname and not parts.username:
+                        self.url = self.href
+                except ValueError:
+                    pass
+            self.href = None
+
+
+def message_payload(chat_id: str | int, text: str) -> dict:
+    """Keep source links accessible through a native URL button in both delivery paths."""
+    parser = _SourceLinkParser()
+    parser.feed(text)
+    payload = {
+        "chat_id": chat_id,
+        "text": text,
+        "parse_mode": "HTML",
+        "link_preview_options": {"is_disabled": True},
+    }
+    if parser.url:
+        payload["reply_markup"] = {
+            "inline_keyboard": [[{"text": "원문 보기", "url": parser.url}]],
+        }
+    return payload
 
 
 class TelegramError(RuntimeError):
@@ -61,10 +108,7 @@ class Telegram:
     async def send(self, text: str) -> int:
         result = await self.call(
             "sendMessage",
-            chat_id=self.channel_id,
-            text=text,
-            parse_mode="HTML",
-            link_preview_options={"is_disabled": True},
+            **message_payload(self.channel_id, text),
         )
         if not isinstance(result, dict) or not isinstance(result.get("message_id"), int):
             raise DeliveryUncertain("전송 응답에 메시지 ID가 없습니다.")
