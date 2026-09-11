@@ -34,6 +34,31 @@ def command(text, chat_id=42, chat_type="private"):
     return {"update_id": 10, "message": {"chat": {"id": chat_id, "type": chat_type}, "text": text}}
 
 
+def test_latest_includes_source_button_for_fresh_and_cached_messages(monkeypatch):
+    telegram = FakeTelegram()
+    handler = CommandHandler(Settings(), telegram, "our_bot")
+    post = '<b>브리핑</b>\n<a href="https://example.com/?a=1&amp;b=2">원문 보기</a>'
+
+    async def digest(*_args, **_kwargs):
+        return SimpleNamespace(messages=[post])
+
+    monkeypatch.setattr(bot_runtime, "run_digest", digest)
+
+    async def run():
+        await handler.handle(command("/latest", chat_id=42))
+        await handler.handle(command("/latest", chat_id=43))
+
+    asyncio.run(run())
+    assert "reply_markup" not in telegram.calls[0][1]
+    for _, payload in telegram.calls[1:]:
+        assert payload["text"] == post
+        assert payload["parse_mode"] == "HTML"
+        assert payload["reply_markup"] == {
+            "inline_keyboard": [[{"text": "원문 보기", "url": "https://example.com/?a=1&b=2"}]],
+        }
+    assert len(telegram.calls) == 3
+
+
 def test_commands_only_respond_in_private_chats_and_ignore_other_targets(monkeypatch):
     telegram = FakeTelegram()
     handler = CommandHandler(Settings(), telegram, "Our_Bot")
