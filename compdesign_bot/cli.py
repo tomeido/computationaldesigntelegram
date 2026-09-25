@@ -3,7 +3,9 @@ import asyncio
 import json
 import logging
 import sys
+from dataclasses import asdict
 from datetime import UTC, datetime
+from pathlib import Path
 
 import httpx
 
@@ -133,7 +135,8 @@ async def configure_bot(settings: Settings):
         "Web3·블록체인과 컴퓨테이셔널 디자인의 접점을 먼저 전합니다. "
         "온체인 생성 예술, AI 디자인 도구, 파라메트릭 디자인, 크리에이티브 코딩 소식을 "
         "논문·투자 및 지원 소식·작품과 실험까지 한국어 발췌·번역과 원문 링크로 확인하세요.\n\n"
-        "/latest 최신 브리핑\n/tools 추천 GitHub 도구\n/sources 정보 출처\n/help 이용 안내"
+        "/latest 최신 브리핑\n/subscribe 메일링 가입\n/unsubscribe 메일링 해지\n"
+        "/invite 방 초대 링크\n/tools 추천 GitHub 도구\n/help 이용 안내"
     )
     commands = [
         {"command": command, "description": text}
@@ -142,6 +145,10 @@ async def configure_bot(settings: Settings):
             ("latest", "최신 한국어 디자인 브리핑"),
             ("tools", "추천 GitHub 도구와 활용법"),
             ("sources", "정보 출처 확인"),
+            ("subscribe", "이메일로 브리핑 받기"),
+            ("unsubscribe", "메일링 리스트 수신 해지"),
+            ("invite", "텔레그램 방 초대 링크"),
+            ("cancel", "메일 주소 입력 취소"),
             ("help", "이용 안내와 채널 연결 방법"),
         )
     ]
@@ -197,7 +204,37 @@ async def discover_channel(settings: Settings):
 
 
 async def dispatch(args, settings: Settings):
-    if args.command == "collect":
+    if args.command in {"mail-import", "mail-status", "mail-send", "resolve-mail-delivery"}:
+        from .mail_delivery import send_mail_queue, sync_mail_queue
+        from .mailing import MailingStore
+
+        if args.command == "mail-send":
+            report = await asyncio.to_thread(send_mail_queue, settings)
+            print(json.dumps(asdict(report), ensure_ascii=False, indent=2))
+            if report.failed or report.uncertain:
+                raise RuntimeError("메일 전송 실패 또는 결과 불명 기록이 있습니다. mail-status로 확인하세요.")
+            return
+        if args.command == "mail-status":
+            await asyncio.to_thread(sync_mail_queue, settings)
+        with job_lock(settings.database_path.with_suffix(".mail.sqlite3")):
+            mail = MailingStore(settings.database_path)
+            try:
+                if args.command == "mail-import":
+                    path = args.xlsx or settings.mailing_xlsx_path
+                    if not path:
+                        raise ValueError("XLSX 파일 경로 또는 MAILING_XLSX_PATH를 지정하세요.")
+                    print(json.dumps(asdict(mail.import_xlsx(path)), ensure_ascii=False, indent=2))
+                elif args.command == "mail-status":
+                    print(json.dumps({
+                        "subscribers": mail.status_counts(), "outbox": mail.outbox_counts(),
+                        "unresolved": mail.unresolved(),
+                    }, ensure_ascii=False, indent=2))
+                else:
+                    mail.resolve(args.id, retry=args.retry)
+                    print("메일 재시도를 허용했습니다." if args.retry else "메일 발송 완료로 기록했습니다.")
+            finally:
+                mail.close()
+    elif args.command == "collect":
         await collect(settings, args.json)
     elif args.command == "doctor":
         await doctor(settings)
@@ -222,6 +259,10 @@ async def dispatch(args, settings: Settings):
         from .bot_runtime import listen
 
         settings.require_token()
+        if settings.mailing_xlsx_path:
+            from .mail_delivery import sync_mail_queue
+
+            await asyncio.to_thread(sync_mail_queue, settings)
         if args.command == "run" and settings.channel_id:
             await asyncio.gather(listen(settings), serve(settings))
         else:
@@ -242,6 +283,8 @@ async def dispatch(args, settings: Settings):
             print("새로 제공할 소식이 없습니다.")
         if result.failed:
             raise RuntimeError(f"{result.failed}건을 요약·서식 오류로 건너뛰었습니다.")
+        if args.command == "publish" and settings.mailing_enabled:
+            print(f"메일 발송 {result.mailed}건 / 실패·결과 불명 {result.mail_failed}건 (mail-status로 대기 확인)")
     elif args.command in ("status", "resolve-delivery"):
         with job_lock(settings.database_path):
             store = Store(settings.database_path)
@@ -283,6 +326,15 @@ def main():
     sub.add_parser("discover-channel", help="봇이 추가된 채널 ID 확인")
     sub.add_parser("configure-channel", help="기존 채널 이름·소개 변경")
     sub.add_parser("status", help="발행 기록과 미확인 전송 보기")
+    p = sub.add_parser("mail-import", help="XLSX 메일 목록 가져오기 (중복·수신 해지 제외)")
+    p.add_argument("xlsx", type=Path, nargs="?")
+    sub.add_parser("mail-status", help="메일 구독자 수와 발송 대기·실패 기록 확인")
+    sub.add_parser("mail-send", help="대기 중인 브리핑 메일 발송 (텔레그램 재발행 없음)")
+    p = sub.add_parser("resolve-mail-delivery", help="SMTP 확인 후 미확인·실패 메일 기록 처리")
+    p.add_argument("id", type=int)
+    group = p.add_mutually_exclusive_group(required=True)
+    group.add_argument("--retry", action="store_true", help="미전송을 확인한 메일만 재시도 허용")
+    group.add_argument("--sent", action="store_true", help="발송 완료로 표시")
     p = sub.add_parser("resolve-delivery", help="채널 확인 후 미확인 전송 기록 처리")
     p.add_argument("id", type=int)
     group = p.add_mutually_exclusive_group(required=True)

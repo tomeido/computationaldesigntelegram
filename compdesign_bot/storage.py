@@ -49,6 +49,9 @@ class Store:
         if "slot" not in columns:
             self.db.execute("ALTER TABLE deliveries ADD COLUMN slot TEXT")
             self.db.commit()
+        if "post_html" not in columns:
+            self.db.execute("ALTER TABLE deliveries ADD COLUMN post_html TEXT")
+            self.db.commit()
 
     def close(self):
         self.db.close()
@@ -71,12 +74,13 @@ class Store:
             is not None
         )
 
-    def reserve(self, article: Article, channel: str, slot: str | None = None) -> int:
+    def reserve(self, article: Article, channel: str, slot: str | None = None, post_html: str | None = None) -> int:
         url, title_key = identity(article)
         with self.db:
             cursor = self.db.execute(
-                "INSERT INTO deliveries(channel,url,title_key,title,status,created_at,slot) VALUES(?,?,?,?,?,?,?)",
-                (channel, url, title_key, article.title, "pending", datetime.now(UTC).isoformat(), slot),
+                "INSERT INTO deliveries(channel,url,title_key,title,status,created_at,slot,post_html) "
+                "VALUES(?,?,?,?,?,?,?,?)",
+                (channel, url, title_key, article.title, "pending", datetime.now(UTC).isoformat(), slot, post_html),
             )
         return cursor.lastrowid
 

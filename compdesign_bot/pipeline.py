@@ -17,7 +17,7 @@ from .models import RankedArticle
 from .quality import select_quality
 from .ranking import rank_articles
 from .storage import Store, cache_key, job_lock
-from .telegram import DeliveryUncertain, Telegram, TelegramError
+from .telegram import DeliveryUncertain, Telegram, TelegramError, channel_invite_url, mailing_signup_url
 
 log = logging.getLogger(__name__)
 
@@ -30,6 +30,8 @@ class RunResult:
     failed: int = 0
     messages: list[str] | None = None
     quality_rejected: int = 0
+    mailed: int = 0
+    mail_failed: int = 0
 
 
 async def collect_report(settings: Settings, client: httpx.AsyncClient) -> FetchReport:
@@ -65,6 +67,25 @@ def varied_candidates(candidates: list[RankedArticle]) -> list[RankedArticle]:
 
 
 async def run_digest(settings: Settings, *, publish: bool = False, slot: str | None = None) -> RunResult:
+    try:
+        result = await _run_digest(settings, publish=publish, slot=slot)
+    except Exception:
+        if publish:
+            from .mail_delivery import auto_send_mail
+
+            await auto_send_mail(settings)
+        raise
+    if publish:
+        from .mail_delivery import auto_send_mail
+
+        report = await auto_send_mail(settings)
+        if report is not None:
+            result.mailed = report.sent
+            result.mail_failed = report.failed + report.uncertain
+    return result
+
+
+async def _run_digest(settings: Settings, *, publish: bool = False, slot: str | None = None) -> RunResult:
     if publish:
         settings.require_telegram()
     with job_lock(settings.database_path):
@@ -72,10 +93,15 @@ async def run_digest(settings: Settings, *, publish: bool = False, slot: str | N
         try:
             async with httpx.AsyncClient(follow_redirects=False) as client:
                 # Feed fetcher follows public feed redirects explicitly; credential APIs never redirect.
-                telegram = Telegram(client, settings.bot_token, settings.channel_id)
+                telegram = Telegram(
+                    client, settings.bot_token, settings.channel_id,
+                    invite_url=channel_invite_url(settings.channel_id, settings.telegram_invite_url),
+                    bot_username=settings.bot_username,
+                )
                 channel = store.channel_for(settings.channel_id)
                 if publish:
                     access = await telegram.check_access()
+                    telegram.subscribe_url = mailing_signup_url(access.get("bot") or settings.bot_username)
                     channel = str(access["id"])
                     store.remember_channel(settings.channel_id, channel)
                 if slot and store.slot_done(channel, slot):
@@ -134,7 +160,7 @@ async def run_digest(settings: Settings, *, publish: bool = False, slot: str | N
                         result.failed += 1
                         continue
                     if publish:
-                        delivery_id = store.reserve(item.article, channel, slot)
+                        delivery_id = store.reserve(item.article, channel, slot, post_html=post)
                         try:
                             message_id = await telegram.send(post)
                         except DeliveryUncertain:

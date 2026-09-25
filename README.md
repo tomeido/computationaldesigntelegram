@@ -169,6 +169,69 @@ GitHub에서는 Art Blocks, onchfs, COMPAS, p5.js, NVIDIA Warp의 공식 릴리�
 
 ## 설정
 
+### 이메일 브리핑과 텔레그램 가입
+
+채널에 게시한 동일한 브리핑을 수신자별 개별 메일로 보낼 수 있습니다. 메일에는 원문,
+텔레그램 방 초대 링크, 개인별 수신 해지 링크가 포함됩니다. 주소는 다른 수신자에게 공개되지 않습니다.
+
+```bash
+python -m compdesign_bot mail-import research_mailing_list_checked.xlsx
+python -m compdesign_bot mail-status
+```
+
+`발송 점검` 시트가 있으면 `기본 점검 통과` 주소만 가져오고 `추가 확인` 주소는 보류합니다.
+중복은 한 번만 등록하고, 해지한 주소는 엑셀을 다시 가져와도 재가입되지 않습니다.
+메일링 목록과 발송 기록은 기존 `DATABASE_PATH`에 저장하며, 개인정보가 있는 XLSX는 Git과 Docker 이미지에서 제외합니다.
+
+`.env`에 다음 값을 설정하세요. `SMTP_FROM`에는 표시 이름 없이 이메일 주소만 입력합니다.
+
+```dotenv
+MAILING_ENABLED=true
+SMTP_HOST=smtp.example.com
+SMTP_PORT=587
+SMTP_SECURITY=starttls
+SMTP_USERNAME=sender@example.com
+SMTP_PASSWORD=발송서비스의_인증정보
+SMTP_FROM=sender@example.com
+TELEGRAM_BOT_USERNAME=ComputationalDesign_bot
+TELEGRAM_INVITE_URL=https://t.me/ComputationalDesignKorea
+```
+
+465번 포트의 암호화 연결은 `SMTP_SECURITY=ssl`을 사용합니다. `MAILING_XLSX_PATH`는 선택 사항이며,
+설정하면 시작 및 발행 시 해당 파일을 가져옵니다. 한번 `mail-import`를 했다면 비워 두어도 됩니다.
+메일 설정이 없어도 텔레그램 게시와 구독 등록은 동작하며, `MAILING_ENABLED=true`인 경우 메일은 대기열에 남습니다.
+설정을 바꾼 뒤 실행 중인 봇을 재시작하세요. Docker는 `docker compose up -d --force-recreate bot`을 사용합니다.
+
+텔레그램 봇 개인 대화에서 `/subscribe`를 누르고 본인 이메일을 보내거나
+`/subscribe name@example.com`으로 가입합니다. `/unsubscribe`로 본인 구독을 해지하고,
+`/cancel`로 주소 입력을 취소하며, `/invite`로 방 초대 링크를 확인합니다.
+엑셀로 등록된 수신자는 메일의 해지 링크로 봇을 열고 `/unsubscribe`로 확인합니다.
+명령어 메뉴는 `python -m compdesign_bot configure-bot`으로 갱신합니다.
+
+`publish` 및 예약 발행은 게시 성공한 글을 메일 대기열에도 기록합니다.
+미리보기와 `/latest` 요청은 메일을 발송하지 않습니다. 가입 시점 이전의 모든 과거 글을 소급 발송하지 않습니다.
+전송 성공 여부가 불명확하거나 실패한 메일은 자동 반복 발송하지 않습니다.
+SMTP 제공업체의 전송 기록을 확인한 후 아래 명령으로 처리하세요.
+
+```bash
+python -m compdesign_bot mail-send  # 대기 메일 발송; 텔레그램 글은 다시 게시하지 않음
+python -m compdesign_bot resolve-mail-delivery 123 --sent
+# 미전송을 확인한 경우에만:
+python -m compdesign_bot resolve-mail-delivery 123 --retry
+python -m compdesign_bot mail-send
+```
+
+Docker에서는 XLSX를 이미지에 넣지 않고 일회성으로 읽기 전용 마운트하여 가져옵니다.
+
+```bash
+docker compose run --rm --no-deps \
+  -v "$PWD/research_mailing_list_checked.xlsx:/app/mailing.xlsx:ro" \
+  bot python -m compdesign_bot mail-import /app/mailing.xlsx
+```
+
+연결 방식은 [Python SMTP 문서](https://docs.python.org/3/library/smtplib.html),
+가입·해지 링크는 [Telegram 봇 deep link 문서](https://core.telegram.org/bots/features#deep-linking)를 따릅니다.
+
 | 변수 | 기본값 | 설명 |
 | --- | --- | --- |
 | `TELEGRAM_BOT_TOKEN` | 비어 있음 | BotFather에서 발급한 토큰 |

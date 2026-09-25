@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import re
+import sqlite3
 import tempfile
 import time
 from collections import OrderedDict
@@ -21,9 +22,10 @@ import httpx
 from .config import Settings
 from .feeds import load_sources
 from .github_sources import load_repositories
+from .mailing import MailingStore
 from .pipeline import run_digest
 from .resources import public_resource_url
-from .telegram import Telegram, TelegramError, message_payload
+from .telegram import Telegram, TelegramError, channel_invite_url, mailing_signup_url, message_payload
 
 log = logging.getLogger(__name__)
 
@@ -142,11 +144,18 @@ class CommandHandler:
         self.cached_messages: list[str] | None = None
         self.cached_at = float("-inf")
         self.last_fetch_at = float("-inf")
+        self.pending_unsubscribes: OrderedDict[int, tuple[str, float]] = OrderedDict()
+        self.invite_url = channel_invite_url(settings.channel_id, settings.telegram_invite_url)
+        self.subscribe_url = mailing_signup_url(username)
 
-    async def _reply(self, chat_id: int, text: str) -> None:
+    async def _reply(self, chat_id: int, text: str, *, post: bool = False) -> None:
         await self.telegram.call(
             "sendMessage",
-            **message_payload(chat_id, text),
+            **message_payload(
+                chat_id, text,
+                invite_url=self.invite_url if post else "",
+                subscribe_url=self.subscribe_url if post else "",
+            ),
         )
 
     def _welcome(self) -> str:
@@ -159,12 +168,16 @@ class CommandHandler:
             "/latest — 최신 브리핑 최대 3건\n"
             "/tools — 추천 GitHub 도구와 활용법\n"
             "/sources — 수집 출처\n"
+            "/invite — 텔레그램 방 초대 링크\n"
+            "/subscribe — 이메일 브리핑 가입\n"
+            "/unsubscribe — 이메일 브리핑 수신 거부\n"
+            "/cancel — 이메일 입력·수신 거부 취소\n"
             "/help — 이용 안내\n\n"
             "최신 브리핑은 1시간 동안 함께 사용하며, 개인별 요청 간격은 1분입니다."
         )
         channel = self.settings.channel_id
-        if re.fullmatch(r"@[A-Za-z][A-Za-z0-9_]{4,31}", channel):
-            text += f'\n\n<a href="https://t.me/{channel[1:]}">브리핑 채널 보기</a>'
+        if self.invite_url:
+            text += f'\n\n<a href="{escape(self.invite_url, quote=True)}">텔레그램 방 참여</a>'
         elif channel:
             text += "\n\n연결된 채널의 초대 링크는 채널 운영자에게 확인하세요."
         else:
@@ -175,6 +188,86 @@ class CommandHandler:
                 "봇 토큰만으로 채널을 새로 만들 수는 없습니다."
             )
         return text
+
+    async def _invite(self, chat_id: int) -> None:
+        if self.invite_url:
+            await self._reply(
+                chat_id, f'<a href="{escape(self.invite_url, quote=True)}">텔레그램 방 초대 링크</a>',
+            )
+        else:
+            await self._reply(chat_id, "방 초대 링크가 아직 설정되지 않았습니다. 운영자에게 확인해 주세요.")
+
+    async def _subscribe(self, user_id: int, email: str = "") -> None:
+        self.pending_unsubscribes.pop(user_id, None)
+        with MailingStore(self.settings.database_path) as store:
+            if not email:
+                store.set_awaiting_email(user_id, True)
+                reply = (
+                    "Computational Web3 브리핑을 받을 본인의 이메일 주소를 이 개인 대화에 입력해 주세요.\n"
+                    "주소를 보내면 브리핑 이메일 수신에 동의하며, /unsubscribe로 언제든 수신을 중단할 수 있습니다.\n"
+                    "가입을 취소하려면 /cancel을 입력하세요."
+                )
+            else:
+                try:
+                    result = store.subscribe(email, telegram_user_id=user_id)
+                except ValueError:
+                    store.set_awaiting_email(user_id, True)
+                    reply = "이메일 주소 하나를 정확히 입력해 주세요. 예: name@example.com\n취소: /cancel"
+                else:
+                    store.set_awaiting_email(user_id, False)
+                    if result == "subscribed":
+                        reply = "메일링 리스트에 가입했습니다. /unsubscribe로 언제든 수신을 중단할 수 있습니다."
+                        if (
+                            not self.settings.mailing_enabled
+                            or not self.settings.smtp_host
+                            or not self.settings.smtp_from
+                        ):
+                            reply += "\n메일 발송 준비가 완료되면 새 브리핑을 보내드립니다."
+                    else:
+                        reply = (
+                            "이미 등록된 이메일입니다. 기존 가입은 유지됩니다.\n"
+                            "이 계정에서 가입했다면 /unsubscribe, 그렇지 않다면 받은 메일의 수신 거부 링크를 이용하세요."
+                        )
+        await self._reply(user_id, reply)
+
+    async def _unsubscribe(self, user_id: int) -> None:
+        pending = self.pending_unsubscribes.pop(user_id, None)
+        with MailingStore(self.settings.database_path) as store:
+            store.set_awaiting_email(user_id, False)
+            if pending is not None:
+                token, created_at = pending
+                if time.monotonic() - created_at > 900:
+                    reply = "확인 시간이 만료되었습니다. 메일의 수신 거부 링크를 다시 열어 주세요."
+                elif store.unsubscribe_token(token):
+                    reply = "이메일 브리핑 수신을 중단했습니다."
+                else:
+                    reply = "유효한 수신 거부 링크를 확인하지 못했습니다. 받은 메일의 링크를 다시 확인해 주세요."
+            elif store.unsubscribe_user(user_id):
+                reply = "이메일 브리핑 수신을 중단했습니다. 다시 가입하려면 /subscribe를 입력하세요."
+            else:
+                reply = (
+                    "이 텔레그램 계정으로 가입한 이메일이 없습니다.\n"
+                    "엑셀 목록 등으로 가입했다면 받은 메일의 수신 거부 링크를 이용해 주세요."
+                )
+        await self._reply(user_id, reply)
+
+    async def _start_unsubscribe(self, user_id: int, token: str) -> None:
+        with MailingStore(self.settings.database_path) as store:
+            store.set_awaiting_email(user_id, False)
+        self.pending_unsubscribes[user_id] = (token, time.monotonic())
+        self.pending_unsubscribes.move_to_end(user_id)
+        while len(self.pending_unsubscribes) > MAX_CHATS:
+            self.pending_unsubscribes.popitem(last=False)
+        await self._reply(
+            user_id,
+            "이 메일링의 이메일 수신을 중단하려면 /unsubscribe를 입력해 주세요.\n취소: /cancel",
+        )
+
+    async def _cancel(self, user_id: int) -> None:
+        self.pending_unsubscribes.pop(user_id, None)
+        with MailingStore(self.settings.database_path) as store:
+            store.set_awaiting_email(user_id, False)
+        await self._reply(user_id, "입력을 취소했습니다. 다시 가입하려면 /subscribe를 입력하세요.")
 
     def _sources(self) -> str:
         text = "<b>브리핑 수집 출처</b>\nWeb3·블록체인 디자인 소식을 우선 선별합니다.\n"
@@ -256,14 +349,14 @@ class CommandHandler:
             await self._reply(chat_id, "최근 수집한 소식 중 주제에 맞는 새 브리핑이 없습니다. 다음 갱신을 기다려 주세요.")
             return
         for message in messages:
-            await self._reply(chat_id, message)
+            await self._reply(chat_id, message, post=True)
 
     async def handle(self, update: dict) -> None:
         message = update.get("message")
         if not isinstance(message, dict):
             return
         chat = message.get("chat")
-        if not isinstance(chat, dict) or chat.get("type") != "private" or type(chat.get("id")) is not int:
+        if not isinstance(chat, dict) or type(chat.get("id")) is not int:
             return
         sender = message.get("from", {})
         if isinstance(sender, dict) and sender.get("is_bot"):
@@ -272,12 +365,51 @@ class CommandHandler:
         if not isinstance(text, str):
             return
         match = re.match(r"^/([a-zA-Z]+)(?:@([a-zA-Z0-9_]+))?(?:\s|$)", text)
-        if match is None or (match[2] and match[2].casefold() != self.username):
+        if match is not None and match[2] and match[2].casefold() != self.username:
             return
-        command, chat_id = match[1].casefold(), chat["id"]
+        command = match[1].casefold() if match else ""
+        argument = text[match.end():].strip() if match else ""
+        chat_id = chat["id"]
+        user_id = sender.get("id") if isinstance(sender, dict) else None
+        verified_private = (
+            chat.get("type") == "private" and type(user_id) is int and user_id == chat_id and user_id > 0
+        )
         try:
-            if command in {"start", "help"}:
+            if chat.get("type") != "private":
+                if chat.get("type") not in {"group", "supergroup"}:
+                    return
+                if command in {"subscribe", "unsubscribe"} or (command == "start" and argument == "subscribe"):
+                    # Never parse, retain or repeat an email posted in a group.
+                    link = (
+                        self.subscribe_url.removesuffix("?start=subscribe")
+                        if command == "unsubscribe" else self.subscribe_url
+                    )
+                    reply = "이메일 주소는 봇과의 개인 대화에서 입력해 주세요."
+                    if link:
+                        reply += f'\n<a href="{escape(link, quote=True)}">개인 대화에서 메일링 관리</a>'
+                    await self._reply(chat_id, reply)
+                elif command == "invite":
+                    await self._invite(chat_id)
+                return
+            if command == "subscribe" or (command == "start" and argument == "subscribe"):
+                if verified_private:
+                    await self._subscribe(user_id, argument if command == "subscribe" else "")
+            elif command == "start" and argument.startswith("unsubscribe_"):
+                token = argument.removeprefix("unsubscribe_")
+                if verified_private and re.fullmatch(r"[A-Za-z0-9_-]{20,52}", token):
+                    await self._start_unsubscribe(user_id, token)
+                else:
+                    await self._reply(chat_id, "수신 거부 링크를 확인해 주세요.")
+            elif command == "unsubscribe":
+                if verified_private:
+                    await self._unsubscribe(user_id)
+            elif command == "cancel":
+                if verified_private:
+                    await self._cancel(user_id)
+            elif command in {"start", "help"}:
                 await self._reply(chat_id, self._welcome())
+            elif command == "invite":
+                await self._invite(chat_id)
             elif command == "sources":
                 await self._reply(chat_id, self._sources())
             elif command == "tools":
@@ -285,11 +417,23 @@ class CommandHandler:
                     await self._reply(chat_id, text)
             elif command == "latest":
                 await self._latest(chat_id)
+            elif (
+                match is None and not text.startswith("/") and verified_private
+                and self.settings.database_path.exists()
+            ):
+                with MailingStore(self.settings.database_path) as store:
+                    awaiting = store.awaiting_email(user_id)
+                if awaiting:
+                    await self._subscribe(user_id, text.strip())
         except TelegramError:
             # An uncertain reply must not be replayed automatically; mark the update handled.
             log.warning("개인 명령 응답을 전달하지 못했습니다.")
-        except (OSError, ValueError):
+        except (OSError, ValueError, sqlite3.Error):
             log.warning("개인 명령 설정을 읽지 못했습니다.")
+            try:
+                await self._reply(chat_id, "지금은 요청을 처리하지 못했습니다. 잠시 후 다시 시도해 주세요.")
+            except TelegramError:
+                log.warning("개인 명령 응답을 전달하지 못했습니다.")
 
 
 async def listen(settings: Settings) -> None:

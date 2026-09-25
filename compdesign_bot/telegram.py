@@ -1,4 +1,5 @@
 import asyncio
+import re
 from html.parser import HTMLParser
 from urllib.parse import urlsplit
 
@@ -33,8 +34,39 @@ class _SourceLinkParser(HTMLParser):
             self.href = None
 
 
-def message_payload(chat_id: str | int, text: str) -> dict:
-    """Keep source links accessible through a native URL button in both delivery paths."""
+def channel_invite_url(channel_id: str, configured_url: str = "") -> str:
+    """Use a configured Telegram invitation, falling back to a public channel URL."""
+    if configured_url:
+        try:
+            parts = urlsplit(configured_url)
+            if (
+                parts.scheme == "https"
+                and parts.hostname in {"t.me", "telegram.me"}
+                and not parts.username
+                and not parts.password
+                and parts.port in {None, 443}
+                and parts.path not in {"", "/"}
+                and not any(character.isspace() for character in configured_url)
+            ):
+                return configured_url
+        except ValueError:
+            pass
+    if re.fullmatch(r"@[A-Za-z][A-Za-z0-9_]{4,31}", channel_id):
+        return f"https://t.me/{channel_id[1:]}"
+    return ""
+
+
+def mailing_signup_url(bot_username: str) -> str:
+    username = bot_username.removeprefix("@")
+    if re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{4,31}", username):
+        return f"https://t.me/{username}?start=subscribe"
+    return ""
+
+
+def message_payload(
+    chat_id: str | int, text: str, *, invite_url: str = "", subscribe_url: str = ""
+) -> dict:
+    """Keep source, room invitation and mailing signup accessible through URL buttons."""
     parser = _SourceLinkParser()
     parser.feed(text)
     payload = {
@@ -43,10 +75,18 @@ def message_payload(chat_id: str | int, text: str) -> dict:
         "parse_mode": "HTML",
         "link_preview_options": {"is_disabled": True},
     }
+    buttons = []
     if parser.url:
-        payload["reply_markup"] = {
-            "inline_keyboard": [[{"text": "원문 보기", "url": parser.url}]],
-        }
+        buttons.append([{"text": "원문 보기", "url": parser.url}])
+    community = []
+    if invite_url:
+        community.append({"text": "텔레그램 방 참여", "url": invite_url})
+    if subscribe_url:
+        community.append({"text": "메일링 가입", "url": subscribe_url})
+    if community:
+        buttons.append(community)
+    if buttons:
+        payload["reply_markup"] = {"inline_keyboard": buttons}
     return payload
 
 
@@ -59,8 +99,13 @@ class DeliveryUncertain(TelegramError):
 
 
 class Telegram:
-    def __init__(self, client: httpx.AsyncClient, token: str, channel_id: str):
+    def __init__(
+        self, client: httpx.AsyncClient, token: str, channel_id: str,
+        *, invite_url: str = "", bot_username: str = "",
+    ):
         self.client, self.token, self.channel_id = client, token, channel_id
+        self.invite_url = channel_invite_url("", invite_url)
+        self.subscribe_url = mailing_signup_url(bot_username)
 
     async def call(self, method: str, **payload):
         for attempt in range(3):
@@ -108,7 +153,9 @@ class Telegram:
     async def send(self, text: str) -> int:
         result = await self.call(
             "sendMessage",
-            **message_payload(self.channel_id, text),
+            **message_payload(
+                self.channel_id, text, invite_url=self.invite_url, subscribe_url=self.subscribe_url,
+            ),
         )
         if not isinstance(result, dict) or not isinstance(result.get("message_id"), int):
             raise DeliveryUncertain("전송 응답에 메시지 ID가 없습니다.")

@@ -54,7 +54,10 @@ def test_latest_includes_source_button_for_fresh_and_cached_messages(monkeypatch
         assert payload["text"] == post
         assert payload["parse_mode"] == "HTML"
         assert payload["reply_markup"] == {
-            "inline_keyboard": [[{"text": "원문 보기", "url": "https://example.com/?a=1&b=2"}]],
+            "inline_keyboard": [
+                [{"text": "원문 보기", "url": "https://example.com/?a=1&b=2"}],
+                [{"text": "메일링 가입", "url": "https://t.me/our_bot?start=subscribe"}],
+            ],
         }
     assert len(telegram.calls) == 3
 

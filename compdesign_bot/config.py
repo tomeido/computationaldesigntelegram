@@ -1,7 +1,9 @@
 import os
+import re
 from dataclasses import dataclass, field
 from datetime import time
 from pathlib import Path
+from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from dotenv import load_dotenv
@@ -17,6 +19,13 @@ def _integer(name: str, default: int, low: int, high: int) -> int:
     if not low <= value <= high:
         raise ValueError(f"{name}: {low}~{high} 범위로 입력하세요.")
     return value
+
+
+def _boolean(name: str, default: bool = False) -> bool:
+    value = os.getenv(name, str(default)).strip().lower()
+    if value not in {"true", "false", "1", "0", "yes", "no"}:
+        raise ValueError(f"{name}: true 또는 false를 입력하세요.")
+    return value in {"true", "1", "yes"}
 
 
 @dataclass(frozen=True)
@@ -36,8 +45,34 @@ class Settings:
     sources_file: Path = Path("config/sources.json")
     repositories_file: Path | None = None
     database_path: Path = Path("data/bot.sqlite3")
+    bot_username: str = ""
+    telegram_invite_url: str = ""
+    mailing_enabled: bool = False
+    mailing_xlsx_path: Path | None = None
+    smtp_host: str = ""
+    smtp_port: int = 587
+    smtp_username: str = field(default="", repr=False)
+    smtp_password: str = field(default="", repr=False)
+    smtp_from: str = ""
+    smtp_security: str = "starttls"
 
     def __post_init__(self) -> None:
+        if self.smtp_security not in {"starttls", "ssl"}:
+            raise ValueError("SMTP_SECURITY: starttls 또는 ssl을 입력하세요.")
+        if not 1 <= self.smtp_port <= 65535:
+            raise ValueError("SMTP_PORT: 1~65535 범위로 입력하세요.")
+        if self.bot_username and not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{4,31}", self.bot_username):
+            raise ValueError("TELEGRAM_BOT_USERNAME: @를 제외한 봇 사용자명을 입력하세요.")
+        if self.telegram_invite_url:
+            try:
+                url = urlsplit(self.telegram_invite_url)
+                if (
+                    url.scheme != "https" or url.netloc != "t.me" or not url.path.strip("/")
+                    or any(c.isspace() for c in self.telegram_invite_url)
+                ):
+                    raise ValueError
+            except ValueError:
+                raise ValueError("TELEGRAM_INVITE_URL: https://t.me/ 형식의 방 초대 링크를 입력하세요.") from None
         if self.translation_provider not in {"local", "gemini"}:
             raise ValueError("TRANSLATION_PROVIDER: local 또는 gemini를 입력하세요.")
         try:
@@ -83,7 +118,29 @@ class Settings:
                 else None
             ),
             database_path=Path(os.getenv("DATABASE_PATH", "data/bot.sqlite3")),
+            bot_username=os.getenv("TELEGRAM_BOT_USERNAME", "").strip().lstrip("@"),
+            telegram_invite_url=os.getenv("TELEGRAM_INVITE_URL", "").strip(),
+            mailing_enabled=_boolean("MAILING_ENABLED"),
+            mailing_xlsx_path=(
+                Path(os.environ["MAILING_XLSX_PATH"].strip())
+                if os.getenv("MAILING_XLSX_PATH", "").strip() else None
+            ),
+            smtp_host=os.getenv("SMTP_HOST", "").strip(),
+            smtp_port=_integer("SMTP_PORT", 587, 1, 65535),
+            smtp_username=os.getenv("SMTP_USERNAME", "").strip(),
+            smtp_password=os.getenv("SMTP_PASSWORD", ""),
+            smtp_from=os.getenv("SMTP_FROM", "").strip(),
+            smtp_security=os.getenv("SMTP_SECURITY", "starttls").strip().lower(),
         )
+
+    def require_mail(self) -> None:
+        from .mailing import normalize_email
+
+        if not self.smtp_host or not self.smtp_from:
+            raise ValueError("메일 발송에는 .env의 SMTP_HOST와 SMTP_FROM 설정이 필요합니다.")
+        normalize_email(self.smtp_from)
+        if bool(self.smtp_username) != bool(self.smtp_password):
+            raise ValueError("SMTP_USERNAME과 SMTP_PASSWORD를 함께 입력하세요.")
 
     def require_summary(self) -> None:
         if self.translation_provider == "gemini":

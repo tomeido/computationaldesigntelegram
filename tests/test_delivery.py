@@ -207,6 +207,30 @@ def configure_pipeline(monkeypatch, tmp_path, send_handler, *, max_posts=5):
     )
 
 
+def test_published_posts_use_discovered_bot_username_for_signup_button(monkeypatch, tmp_path):
+    delivered = []
+
+    def send(_request, payload):
+        delivered.append(payload)
+        return httpx.Response(200, json={"ok": True, "result": {"message_id": len(delivered)}})
+
+    settings = replace(
+        configure_pipeline(monkeypatch, tmp_path, send, max_posts=1),
+        telegram_invite_url="https://t.me/+room_invite",
+    )
+    assert settings.bot_username == ""
+    result = asyncio.run(pipeline.run_digest(settings, publish=True))
+    assert result.posted == 1
+    assert delivered[0]["chat_id"] == "@test"
+    assert delivered[0]["reply_markup"]["inline_keyboard"] == [
+        [{"text": "원문 보기", "url": "https://example.com/1"}],
+        [
+            {"text": "텔레그램 방 참여", "url": "https://t.me/+room_invite"},
+            {"text": "메일링 가입", "url": "https://t.me/test_bot?start=subscribe"},
+        ],
+    ]
+
+
 def test_partial_failure_retry_does_not_repeat_successful_posts(monkeypatch, tmp_path):
     attempts, delivered = [], []
     fail = True
