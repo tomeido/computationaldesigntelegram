@@ -8,7 +8,7 @@ import smtplib
 import sqlite3
 import ssl
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from email.message import EmailMessage
 from email.utils import formatdate, parseaddr
 from html import escape
@@ -17,6 +17,9 @@ from pathlib import Path
 from urllib.parse import unquote, urlsplit
 from xml.etree import ElementTree as ET
 from zipfile import BadZipFile, ZipFile
+
+from .errors import SummaryError
+from .mail_localization import MailLocalizationUnavailable, MailLocalizer, language_copy, normalize_language
 
 _XML = {"s": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
 _REL = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
@@ -69,6 +72,9 @@ class DeliveryReport:
     failed: int = 0
     uncertain: int = 0
     skipped: int = 0
+    deferred: int = 0
+    paused: bool = False
+    localization_failed: int = 0
 
 
 def _email_candidates(value: str) -> list[str]:
@@ -142,6 +148,7 @@ def _xlsx_addresses(path: Path, *, sheet_name: str | None = None, include_review
                 rows = _sheet_rows(archive, sheetpath, strings)
                 email_columns = None
                 control_columns = []
+                language_columns = []
                 first_data = 0
                 for index, row in enumerate(rows[:20]):
                     matches = [
@@ -157,18 +164,26 @@ def _xlsx_addresses(path: Path, *, sheet_name: str | None = None, include_review
                             column for column, value in row.items()
                             if value.strip().lower() in {"사용 판단", "발송 여부", "수신 여부", "상태", "status", "send"}
                         ]
+                        language_columns = [
+                            column for column, value in row.items()
+                            if value.strip().lower() in {
+                                "수신 언어", "메일 언어", "language", "language code", "email language",
+                            }
+                        ]
                         first_data = index + 1
                         break
                 for row in rows[first_data:]:
                     values = [row.get(column, "") for column in email_columns] if email_columns else row.values()
                     controls = {row.get(column, "").strip().lower() for column in control_columns}
+                    language = next((row.get(column, "").strip() for column in language_columns
+                                     if row.get(column, "").strip()), "ko")
                     excluded = bool(controls & {
                         "제외", "수신거부", "수신 거부", "발송 제외", "발송 금지", "아니오", "no", "false",
                         "0", "exclude", "excluded", "unsubscribed", "do not send",
                     }) or (not include_review and "추가 확인" in controls)
                     for value in values:
                         for candidate in _email_candidates(value):
-                            yield candidate, excluded
+                            yield candidate, excluded, language
     except (BadZipFile, KeyError, ET.ParseError):
         raise ValueError("올바른 XLSX 파일이 아닙니다.") from None
 
@@ -187,6 +202,24 @@ class MailingStore:
                 created_at TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS mailing_awaiting (user_id INTEGER PRIMARY KEY);
+            CREATE TABLE IF NOT EXISTS mailing_unsubscribe_confirmations (
+                user_id INTEGER PRIMARY KEY, token TEXT NOT NULL, created_at REAL NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS mailing_language_confirmations (
+                user_id INTEGER PRIMARY KEY, token TEXT NOT NULL, created_at REAL NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS mailing_localizations (
+                post_key TEXT NOT NULL, language TEXT NOT NULL, source_key TEXT NOT NULL,
+                title TEXT NOT NULL, html TEXT NOT NULL,
+                PRIMARY KEY(post_key,language,source_key)
+            );
+            CREATE TABLE IF NOT EXISTS mailing_prospects (
+                email TEXT PRIMARY KEY, name TEXT NOT NULL, organization TEXT NOT NULL,
+                source_url TEXT NOT NULL, relevance TEXT NOT NULL,
+                language_hint TEXT NOT NULL, language_evidence TEXT NOT NULL,
+                consent TEXT NOT NULL DEFAULT 'unknown', status TEXT NOT NULL DEFAULT 'candidate',
+                researched_at TEXT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS mailing_posts (
                 post_key TEXT PRIMARY KEY, title TEXT NOT NULL, telegram_html TEXT NOT NULL,
                 created_at TEXT NOT NULL
@@ -198,6 +231,18 @@ class MailingStore:
                 UNIQUE(post_key, email)
             );
         """)
+        with self.db:
+            self.db.execute("BEGIN IMMEDIATE")
+            subscriber_columns = {row["name"] for row in self.db.execute("PRAGMA table_info(mailing_subscribers)")}
+            if "language" not in subscriber_columns:
+                self.db.execute("ALTER TABLE mailing_subscribers ADD COLUMN language TEXT NOT NULL DEFAULT 'ko'")
+            columns = {row["name"] for row in self.db.execute("PRAGMA table_info(mailing_outbox)")}
+            for name in ("attempted_at", "sent_at", "batch_message_id"):
+                if name not in columns:
+                    self.db.execute(f"ALTER TABLE mailing_outbox ADD COLUMN {name} TEXT")
+            self.db.execute(
+                "CREATE INDEX IF NOT EXISTS mailing_outbox_batch ON mailing_outbox(batch_message_id)"
+            )
 
     def __enter__(self):
         return self
@@ -208,8 +253,10 @@ class MailingStore:
     def close(self):
         self.db.close()
 
-    def subscribe(self, email: str, telegram_user_id: int | None = None) -> str:
+    def subscribe(self, email: str, telegram_user_id: int | None = None, *, language: str | None = None) -> str:
         email = normalize_email(email)
+        if language is not None:
+            language = normalize_language(language)
         if telegram_user_id is not None and (isinstance(telegram_user_id, bool) or telegram_user_id <= 0):
             raise ValueError("개인 텔레그램 사용자 ID가 필요합니다.")
         with self.db:
@@ -240,9 +287,10 @@ class MailingStore:
                 )
             else:
                 self.db.execute(
-                    "INSERT INTO mailing_subscribers(email,token,telegram_user_id,created_at) VALUES(?,?,?,?)",
-                    (email, secrets.token_urlsafe(24), telegram_user_id, datetime.now(UTC).isoformat()),
+                    "INSERT INTO mailing_subscribers(email,token,telegram_user_id,created_at,language) VALUES(?,?,?,?,?)",
+                    (email, secrets.token_urlsafe(24), telegram_user_id, datetime.now(UTC).isoformat(), language or "ko"),
                 )
+            self.db.execute("UPDATE mailing_prospects SET status='subscribed',consent='self_subscribed' WHERE email=?", (email,))
         return "subscribed"
 
     def unsubscribe_user(self, user_id: int) -> int:
@@ -280,17 +328,140 @@ class MailingStore:
     def awaiting_email(self, user_id: int) -> bool:
         return self.db.execute("SELECT 1 FROM mailing_awaiting WHERE user_id=?", (user_id,)).fetchone() is not None
 
+    def set_pending_unsubscribe(self, user_id: int, token: str, created_at: float) -> None:
+        with self.db:
+            self.db.execute(
+                "INSERT INTO mailing_unsubscribe_confirmations VALUES(?,?,?) "
+                "ON CONFLICT(user_id) DO UPDATE SET token=excluded.token, created_at=excluded.created_at",
+                (user_id, token, created_at),
+            )
+
+    def pop_pending_unsubscribe(self, user_id: int) -> tuple[str, float] | None:
+        with self.db:
+            self.db.execute("BEGIN IMMEDIATE")
+            row = self.db.execute(
+                "SELECT token,created_at FROM mailing_unsubscribe_confirmations WHERE user_id=?", (user_id,),
+            ).fetchone()
+            self.db.execute("DELETE FROM mailing_unsubscribe_confirmations WHERE user_id=?", (user_id,))
+        return (row["token"], row["created_at"]) if row else None
+
+    def get_pending_unsubscribe(self, user_id: int) -> tuple[str, float] | None:
+        row = self.db.execute(
+            "SELECT token,created_at FROM mailing_unsubscribe_confirmations WHERE user_id=?", (user_id,),
+        ).fetchone()
+        return (row["token"], row["created_at"]) if row else None
+
+    def set_pending_language(self, user_id: int, token: str, created_at: float) -> None:
+        with self.db:
+            self.db.execute(
+                "INSERT INTO mailing_language_confirmations VALUES(?,?,?) "
+                "ON CONFLICT(user_id) DO UPDATE SET token=excluded.token,created_at=excluded.created_at",
+                (user_id, token, created_at),
+            )
+
+    def get_pending_language(self, user_id: int) -> tuple[str, float] | None:
+        row = self.db.execute(
+            "SELECT token,created_at FROM mailing_language_confirmations WHERE user_id=?", (user_id,),
+        ).fetchone()
+        return (row["token"], row["created_at"]) if row else None
+
+    def clear_pending_language(self, user_id: int) -> None:
+        with self.db:
+            self.db.execute("DELETE FROM mailing_language_confirmations WHERE user_id=?", (user_id,))
+
+    def set_language(self, user_id: int, language: str) -> bool:
+        language = normalize_language(language)
+        with self.db:
+            return bool(self.db.execute(
+                "UPDATE mailing_subscribers SET language=? WHERE telegram_user_id=? AND active=1",
+                (language, user_id),
+            ).rowcount)
+
+    def set_language_token(self, token: str, language: str) -> bool:
+        language = normalize_language(language)
+        with self.db:
+            return bool(self.db.execute(
+                "UPDATE mailing_subscribers SET language=? WHERE token=? AND active=1", (language, token),
+            ).rowcount)
+
+    def get_language(self, user_id: int) -> str | None:
+        row = self.db.execute(
+            "SELECT language FROM mailing_subscribers WHERE telegram_user_id=? AND active=1", (user_id,),
+        ).fetchone()
+        return row["language"] if row else None
+
+    def get_language_token(self, token: str) -> str | None:
+        row = self.db.execute(
+            "SELECT language FROM mailing_subscribers WHERE token=? AND active=1", (token,),
+        ).fetchone()
+        return row["language"] if row else None
+
+    def language_counts(self) -> dict[str, int]:
+        return dict(self.db.execute(
+            "SELECT language,COUNT(*) FROM mailing_subscribers WHERE active=1 GROUP BY language"
+        ))
+
+    def get_localized_post(self, post_key: str, language: str, source_key: str) -> tuple[str, str] | None:
+        row = self.db.execute(
+            "SELECT title,html FROM mailing_localizations WHERE post_key=? AND language=? AND source_key=?",
+            (post_key, language, source_key),
+        ).fetchone()
+        return (row["title"], row["html"]) if row else None
+
+    def cache_localized_post(self, post_key: str, language: str, source_key: str, title: str, html: str) -> None:
+        with self.db:
+            self.db.execute(
+                "INSERT OR REPLACE INTO mailing_localizations VALUES(?,?,?,?,?)",
+                (post_key, language, source_key, title, html),
+            )
+
+    def import_prospects(self, records: list[dict]) -> ImportResult:
+        result = ImportResult()
+        with self.db:
+            for record in records:
+                try:
+                    email = normalize_email(record["email"])
+                    hint = normalize_language(record.get("language_hint") or "bilingual")
+                    source = urlsplit(record["source_url"])
+                    required = ("name", "organization", "source_url", "relevance", "language_evidence", "researched_at")
+                    if any(not isinstance(record.get(key), str) or not record[key].strip() for key in required):
+                        raise ValueError
+                    if source.scheme != "https" or not source.hostname or source.username or source.password:
+                        raise ValueError
+                except (ValueError, KeyError, TypeError, AttributeError):
+                    result.invalid += 1
+                    continue
+                if self.db.execute("SELECT 1 FROM mailing_subscribers WHERE email=?", (email,)).fetchone():
+                    result.duplicates += 1
+                    continue
+                added = self.db.execute(
+                    "INSERT OR IGNORE INTO mailing_prospects"
+                    "(email,name,organization,source_url,relevance,language_hint,language_evidence,researched_at) "
+                    "VALUES(?,?,?,?,?,?,?,?)",
+                    (email, record["name"], record["organization"], record["source_url"], record["relevance"],
+                     hint, record["language_evidence"], record["researched_at"]),
+                ).rowcount
+                if added:
+                    result.imported += 1
+                else:
+                    result.duplicates += 1
+        return result
+
+    def prospect_counts(self) -> dict[str, int]:
+        return dict(self.db.execute("SELECT status,COUNT(*) FROM mailing_prospects GROUP BY status"))
+
     def import_xlsx(self, path: Path, *, sheet_name: str | None = None, include_review: bool = False) -> ImportResult:
         result = ImportResult()
         # Parse before mutating so malformed later sheets cannot leave a partial import.
         addresses = list(_xlsx_addresses(Path(path), sheet_name=sheet_name, include_review=include_review))
         with self.db:
-            for candidate, excluded in addresses:
+            for candidate, excluded, language in addresses:
                 if excluded:
                     result.excluded += 1
                     continue
                 try:
                     email = normalize_email(candidate)
+                    language = normalize_language(language)
                 except ValueError:
                     result.invalid += 1
                     continue
@@ -302,9 +473,10 @@ class MailingStore:
                         result.suppressed += 1
                     continue
                 self.db.execute(
-                    "INSERT INTO mailing_subscribers(email,token,created_at) VALUES(?,?,?)",
-                    (email, secrets.token_urlsafe(24), datetime.now(UTC).isoformat()),
+                    "INSERT INTO mailing_subscribers(email,token,created_at,language) VALUES(?,?,?,?)",
+                    (email, secrets.token_urlsafe(24), datetime.now(UTC).isoformat(), language),
                 )
+                self.db.execute("UPDATE mailing_prospects SET status='imported' WHERE email=?", (email,))
                 result.imported += 1
         return result
 
@@ -312,8 +484,94 @@ class MailingStore:
         counts = dict(self.db.execute("SELECT active,COUNT(*) FROM mailing_subscribers GROUP BY active"))
         return {"active": counts.get(1, 0), "unsubscribed": counts.get(0, 0)}
 
+    def remove_subscriber(self, email: str) -> bool:
+        email = normalize_email(email)
+        with self.db:
+            self.db.execute("BEGIN IMMEDIATE")
+            row = self.db.execute(
+                "SELECT token FROM mailing_subscribers WHERE email=? AND active=1", (email,),
+            ).fetchone()
+            if row is None:
+                return False
+            self.db.execute(
+                "UPDATE mailing_outbox SET status='suppressed' WHERE email=? AND status IN ('queued','failed')",
+                (email,),
+            )
+            self.db.execute("UPDATE mailing_subscribers SET active=0 WHERE email=?", (email,))
+        return True
+
+    def edit_subscriber(self, email: str, *, new_email: str | None = None, language: str | None = None) -> bool:
+        email = normalize_email(email)
+        if new_email is None and language is None:
+            raise ValueError("새 이메일 또는 수신 언어를 지정하세요.")
+        replacement = normalize_email(new_email) if new_email is not None else email
+        if language is not None:
+            language = normalize_language(language)
+        with self.db:
+            self.db.execute("BEGIN IMMEDIATE")
+            row = self.db.execute(
+                "SELECT * FROM mailing_subscribers WHERE email=? AND active=1", (email,),
+            ).fetchone()
+            if row is None:
+                return False
+            if replacement == email:
+                if language is not None:
+                    self.db.execute("UPDATE mailing_subscribers SET language=? WHERE email=?", (language, email))
+                return True
+            if self.db.execute("SELECT 1 FROM mailing_subscribers WHERE email=?", (replacement,)).fetchone():
+                raise ValueError("새 이메일은 이미 등록되었거나 수신 해지된 주소입니다.")
+            self.db.execute(
+                "UPDATE mailing_outbox SET status='suppressed' WHERE email=? AND status IN ('queued','failed')",
+                (email,),
+            )
+            self.db.execute(
+                "UPDATE mailing_subscribers SET active=0,telegram_user_id=NULL WHERE email=?", (email,),
+            )
+            self.db.execute(
+                "INSERT INTO mailing_subscribers(email,token,telegram_user_id,created_at,language) VALUES(?,?,?,?,?)",
+                (replacement, secrets.token_urlsafe(24), row["telegram_user_id"], datetime.now(UTC).isoformat(),
+                 language or row["language"]),
+            )
+            self.db.execute("UPDATE mailing_prospects SET status='imported' WHERE email=?", (replacement,))
+        return True
+
     def outbox_counts(self) -> dict[str, int]:
         return dict(self.db.execute("SELECT status,COUNT(*) FROM mailing_outbox GROUP BY status"))
+
+    def _recent_message_count(self, statuses: tuple[str, ...]) -> int:
+        cutoff = (datetime.now(UTC) - timedelta(hours=24)).isoformat()
+        placeholders = ",".join("?" for _ in statuses)
+        return self.db.execute(
+            "SELECT COUNT(DISTINCT COALESCE(batch_message_id,'legacy:' || id)) FROM mailing_outbox "
+            f"WHERE status IN ({placeholders}) AND COALESCE(sent_at,attempted_at,created_at)>?",
+            (*statuses, cutoff),
+        ).fetchone()[0]
+
+    def delivery_status(self, settings) -> dict:
+        sent = self._recent_message_count(("sent",))
+        reserved = self._recent_message_count(("pending", "uncertain"))
+        pending = self.db.execute(
+            "SELECT COUNT(DISTINCT o.email) FROM mailing_outbox o "
+            "JOIN mailing_subscribers s ON s.email=o.email WHERE o.status='queued' AND s.active=1"
+        ).fetchone()[0]
+        latest = self.db.execute(
+            "SELECT MAX(COALESCE(sent_at,attempted_at,created_at)) FROM mailing_outbox WHERE status='sent'"
+        ).fetchone()[0]
+        paused = self.db.execute(
+            "SELECT COUNT(DISTINCT o.email) FROM mailing_outbox o "
+            "JOIN mailing_subscribers s ON s.email=o.email "
+            "WHERE o.status='queued' AND o.error='smtp_paused' AND s.active=1"
+        ).fetchone()[0]
+        return {
+            "pending_recipients": pending,
+            "paused_recipients": paused,
+            "sent_messages_last_24h": sent,
+            "reserved_messages_last_24h": reserved,
+            "remaining_daily_messages": max(0, settings.mailing_daily_limit - sent - reserved),
+            "last_sent_at": latest,
+            "batch_limit": settings.mailing_batch_limit,
+            "daily_limit": settings.mailing_daily_limit,
+        }
 
     def store_post(self, post_key: str, title: str, telegram_html: str, *, published_at: str | None = None):
         published_at = published_at or datetime.now(UTC).isoformat()
@@ -338,10 +596,19 @@ class MailingStore:
 
     def resolve(self, delivery_id: int, *, retry: bool):
         with self.db:
+            self.db.execute("BEGIN IMMEDIATE")
+            row = self.db.execute(
+                "SELECT batch_message_id FROM mailing_outbox "
+                "WHERE id=? AND status IN ('pending','uncertain','failed')", (delivery_id,),
+            ).fetchone()
+            if not row:
+                raise ValueError("해당 ID의 미확인 이메일 전송 기록이 없습니다.")
+            condition = "batch_message_id=?" if row["batch_message_id"] else "id=?"
             updated = self.db.execute(
-                "UPDATE mailing_outbox SET status=?,error='' "
-                "WHERE id=? AND status IN ('pending','uncertain','failed')",
-                ("queued" if retry else "sent", delivery_id),
+                "UPDATE mailing_outbox SET status=?,error='', "
+                "sent_at=CASE WHEN ? THEN NULL ELSE COALESCE(sent_at,attempted_at,created_at) END "
+                f"WHERE {condition} AND status IN ('pending','uncertain','failed')",
+                ("queued" if retry else "sent", retry, row["batch_message_id"] or delivery_id),
             ).rowcount
             if not updated:
                 raise ValueError("해당 ID의 미확인 이메일 전송 기록이 없습니다.")
@@ -349,17 +616,53 @@ class MailingStore:
     def claim(self, delivery_id: int) -> bool:
         with self.db:
             return bool(self.db.execute(
-                "UPDATE mailing_outbox SET status='pending',attempts=attempts+1,error='' "
+                "UPDATE mailing_outbox SET status='pending',attempts=attempts+1,error='',attempted_at=? "
                 "WHERE id=? AND status='queued' "
                 "AND EXISTS (SELECT 1 FROM mailing_subscribers s WHERE s.email=mailing_outbox.email AND s.active=1)",
-                (delivery_id,),
+                (datetime.now(UTC).isoformat(), delivery_id),
             ).rowcount)
 
-    def finish(self, delivery_id: int, status: str, error: str = ""):
-        if status not in {"sent", "failed", "uncertain", "suppressed"}:
-            raise ValueError("올바르지 않은 이메일 전송 상태입니다.")
+    def claim_batch(self, delivery_ids: list[int], message_id: str, *, daily_limit: int | None = None) -> bool:
+        ids = list(dict.fromkeys(delivery_ids))
+        if not ids:
+            return False
+        placeholders = ",".join("?" for _ in ids)
         with self.db:
-            self.db.execute("UPDATE mailing_outbox SET status=?,error=? WHERE id=?", (status, error, delivery_id))
+            self.db.execute("BEGIN IMMEDIATE")
+            if daily_limit is not None and self._recent_message_count(("sent", "pending", "uncertain")) >= daily_limit:
+                return False
+            eligible = self.db.execute(
+                f"SELECT COUNT(*),COUNT(DISTINCT o.email) FROM mailing_outbox o "
+                f"WHERE o.id IN ({placeholders}) AND o.status='queued' "
+                "AND EXISTS (SELECT 1 FROM mailing_subscribers s WHERE s.email=o.email AND s.active=1)", ids,
+            ).fetchone()
+            if eligible[0] != len(ids) or eligible[1] != 1:
+                return False
+            self.db.execute(
+                "UPDATE mailing_outbox SET status='pending',attempts=attempts+1,error='', "
+                f"attempted_at=?,sent_at=NULL,batch_message_id=? WHERE id IN ({placeholders})",
+                (datetime.now(UTC).isoformat(), message_id, *ids),
+            )
+        return True
+
+    def finish(self, delivery_id: int, status: str, error: str = ""):
+        self.finish_batch([delivery_id], status, error)
+
+    def finish_batch(self, delivery_ids: list[int], status: str, error: str = "") -> None:
+        if status not in {"sent", "failed", "uncertain", "suppressed", "queued"}:
+            raise ValueError("올바르지 않은 이메일 전송 상태입니다.")
+        if not delivery_ids:
+            return
+        placeholders = ",".join("?" for _ in delivery_ids)
+        with self.db:
+            self.db.execute(
+                "UPDATE mailing_outbox SET status=CASE WHEN ?='queued' AND NOT EXISTS ("
+                "SELECT 1 FROM mailing_subscribers s JOIN mailing_posts p ON p.post_key=mailing_outbox.post_key "
+                "WHERE s.email=mailing_outbox.email AND s.active=1 AND s.created_at<=p.created_at"
+                ") THEN 'suppressed' ELSE ? END, "
+                f"error=?,sent_at=? WHERE id IN ({placeholders})",
+                (status, status, error, datetime.now(UTC).isoformat() if status == "sent" else None, *delivery_ids),
+            )
 
 
 class _PostContent(HTMLParser):
@@ -400,19 +703,29 @@ class _PostContent(HTMLParser):
 
 
 def build_email(*, sender: str, recipient: str, title: str, telegram_html: str,
-                invite_url: str, unsubscribe_url: str, message_id: str = "") -> EmailMessage:
+                invite_url: str, unsubscribe_url: str, message_id: str = "",
+                subscribe_url: str = "", language: str = "ko", preferences_url: str = "") -> EmailMessage:
     normalize_email(sender)
     recipient = normalize_email(recipient)
     content = _PostContent()
     content.feed(telegram_html)
     plain = "".join(content.plain)
     html = "".join(content.html)
+    copy = language_copy(language)
     if invite_url:
-        plain += f"\n\n텔레그램 방 참여: {invite_url}"
-        html += f'<br><br><a href="{escape(invite_url, quote=True)}">텔레그램 방 참여</a>'
-    plain += f"\n\n메일 수신 해지: {unsubscribe_url}\n링크를 열고 봇의 안내에 따라 /unsubscribe를 보내면 해지됩니다."
-    html += (f'<br><br><a href="{escape(unsubscribe_url, quote=True)}">메일 수신 해지</a>'
-             '<br>링크를 열고 봇의 안내에 따라 /unsubscribe를 보내면 해지됩니다.')
+        plain += f"\n\n{copy['invite']}: {invite_url}"
+        html += f'<br><br><a href="{escape(invite_url, quote=True)}">{escape(copy["invite"])}</a>'
+    if subscribe_url:
+        plain += f"\n\n{copy['subscribe']}: {subscribe_url}\n{copy['share_hint']}"
+        html += (f'<br><br><a href="{escape(subscribe_url, quote=True)}">{escape(copy["subscribe"])}</a>'
+                 f'<br>{escape(copy["share_hint"])}')
+    if preferences_url:
+        plain += f"\n\n{copy['preferences']}: {preferences_url}\n{copy['preferences_hint']}"
+        html += (f'<br><br><a href="{escape(preferences_url, quote=True)}">{escape(copy["preferences"])}</a>'
+                 f'<br>{escape(copy["preferences_hint"])}')
+    plain += f"\n\n{copy['unsubscribe']}: {unsubscribe_url}\n{copy['unsubscribe_hint']}"
+    html += (f'<br><br><a href="{escape(unsubscribe_url, quote=True)}">{escape(copy["unsubscribe"])}</a>'
+             f'<br>{escape(copy["unsubscribe_hint"])}')
     message = EmailMessage()
     message["From"] = sender
     message["To"] = recipient
@@ -424,7 +737,7 @@ def build_email(*, sender: str, recipient: str, title: str, telegram_html: str,
     message["List-Unsubscribe"] = f"<{unsubscribe_url}>"
     message.set_content(plain)
     message.add_alternative(
-        '<!doctype html><html lang="ko"><body style="font-family:sans-serif;line-height:1.7">'
+        f'<!doctype html><html lang="{copy["html_lang"]}"><body style="font-family:sans-serif;line-height:1.7">'
         + html + "</body></html>", subtype="html",
     )
     return message
@@ -440,6 +753,14 @@ class EmailDeliveryUncertain(RuntimeError):
 
 class EmailConnectionError(EmailDeliveryError):
     """A batch-wide SMTP configuration or connection failure; stop this batch."""
+
+
+class EmailDeliveryPaused(EmailDeliveryError):
+    """A definite SMTP temporary or server-wide rejection; keep the batch queued."""
+
+
+class EmailContentError(EmailDeliveryError):
+    """The SMTP server rejected DATA permanently; stop before repeating the content."""
 
 
 class SMTPMailer:
@@ -469,8 +790,25 @@ class SMTPMailer:
             )
             if refused:
                 raise EmailDeliveryError("SMTP 서버가 수신자를 거절했습니다.")
-        except (smtplib.SMTPRecipientsRefused, smtplib.SMTPSenderRefused, smtplib.SMTPDataError):
+        except smtplib.SMTPRecipientsRefused as error:
+            if any(400 <= response[0] < 500 for response in error.recipients.values()):
+                raise EmailDeliveryPaused("SMTP 서버가 발송을 일시적으로 제한했습니다.") from None
             raise EmailDeliveryError("SMTP 서버가 이메일을 거절했습니다.") from None
+        except smtplib.SMTPDataError as error:
+            response = error.smtp_error.lower()
+            if 400 <= error.smtp_code < 500 or any(
+                marker in response for marker in (b"5.4.5", b"quota", b"sending limit", b"rate limit", b"daily limit")
+            ):
+                raise EmailDeliveryPaused("SMTP 서버가 발송을 제한했습니다. 발송 한도를 확인하세요.") from None
+            raise EmailContentError("SMTP 서버가 메일 내용을 거절했습니다.") from None
+        except smtplib.SMTPSenderRefused:
+            raise EmailConnectionError("SMTP 서버가 발신 주소를 거절했습니다.") from None
+        except smtplib.SMTPResponseException as error:
+            if 400 <= error.smtp_code < 500:
+                raise EmailDeliveryPaused("SMTP 서버가 발송을 일시적으로 제한했습니다.") from None
+            if sending:
+                raise EmailDeliveryUncertain("SMTP 전송 결과를 확인할 수 없습니다.") from None
+            raise EmailConnectionError("SMTP 연결 또는 인증에 실패했습니다.") from None
         except (smtplib.SMTPException, OSError):
             if sending:
                 raise EmailDeliveryUncertain("SMTP 전송 결과를 확인할 수 없습니다.") from None
@@ -483,8 +821,35 @@ class SMTPMailer:
                     connection.close()
 
 
+def _digest_groups(rows):
+    """Bound each recipient digest so a long backlog still produces readable emails."""
+    recipients = {}
+    for row in rows:
+        recipients.setdefault(row["email"], []).append(row)
+    for posts in recipients.values():
+        digest = []
+        size = 0
+        for row in posts:
+            post_size = len((row["title"] + row["telegram_html"]).encode("utf-8"))
+            if digest and (len(digest) >= 20 or size + post_size > 60_000):
+                yield digest
+                digest, size = [], 0
+            digest.append(row)
+            size += post_size
+        if digest:
+            yield digest
+
+
 def deliver_pending(settings, store: MailingStore, *, bot_username: str = "", sender=None) -> DeliveryReport:
-    """Attempt each queued recipient once. Interrupted/uncertain attempts stay reserved."""
+    localizer = MailLocalizer(settings, store)
+    try:
+        return _deliver_pending(settings, store, bot_username=bot_username, sender=sender, localizer=localizer)
+    finally:
+        localizer.close()
+
+
+def _deliver_pending(settings, store: MailingStore, *, bot_username: str, sender, localizer) -> DeliveryReport:
+    """Send recipient digests within batch/24h caps; reserve uncertain results."""
     username = (bot_username or settings.bot_username).lstrip("@")
     if not re.fullmatch(r"[A-Za-z0-9_]{5,32}", username):
         raise ValueError("수신 해지 링크에 사용할 텔레그램 봇 사용자명이 필요합니다.")
@@ -492,40 +857,84 @@ def deliver_pending(settings, store: MailingStore, *, bot_username: str = "", se
     send = sender or SMTPMailer(settings).send
     report = DeliveryReport()
     pending = store.db.execute(
-        "SELECT o.id,o.post_key,o.email,s.token,s.active,p.title,p.telegram_html "
+        "SELECT o.id,o.post_key,o.email,o.attempts,s.token,s.active,s.language,p.title,p.telegram_html "
         "FROM mailing_outbox o JOIN mailing_subscribers s ON s.email=o.email "
         "JOIN mailing_posts p ON p.post_key=o.post_key WHERE o.status='queued' ORDER BY o.id"
     ).fetchall()
-    for row in pending:
+    for rows in _digest_groups(pending):
+        row = rows[0]
+        delivery_ids = [item["id"] for item in rows]
         if not row["active"]:
-            store.finish(row["id"], "suppressed")
+            store.finish_batch(delivery_ids, "suppressed")
             report.skipped += 1
             continue
+        if report.sent + report.failed + report.uncertain >= settings.mailing_batch_limit:
+            break
+        if store._recent_message_count(("sent", "pending", "uncertain")) >= settings.mailing_daily_limit:
+            break
+        language = normalize_language(row["language"])
+        try:
+            localized = [localizer.localize(item["post_key"], item["title"], item["telegram_html"], language)
+                         for item in rows]
+        except (MailLocalizationUnavailable, SummaryError, ValueError):
+            report.localization_failed += 1
+            placeholders = ",".join("?" for _ in delivery_ids)
+            with store.db:
+                store.db.execute(
+                    f"UPDATE mailing_outbox SET error='localization_unavailable' WHERE id IN ({placeholders}) "
+                    "AND status='queued'", delivery_ids,
+                )
+            continue
         unsubscribe_url = f"https://t.me/{username}?start=unsubscribe_{row['token']}"
-        digest = hashlib.sha256(f"{row['post_key']}\0{row['email']}".encode()).hexdigest()
+        digest = hashlib.sha256(
+            (row["email"] + "\0" + "\0".join(
+                f"{item['post_key']}:{item['id']}:{item['attempts'] + 1}" for item in rows
+            )).encode()
+        ).hexdigest()
         domain = normalize_email(settings.smtp_from).rsplit("@", 1)[1]
-        message = build_email(
-            sender=settings.smtp_from, recipient=row["email"], title=row["title"],
-            telegram_html=row["telegram_html"], invite_url=settings.telegram_invite_url,
-            unsubscribe_url=unsubscribe_url, message_id=f"<{digest}@{domain}>",
+        message_id = f"<{digest}@{domain}>"
+        title = localized[0][0] if len(rows) == 1 else language_copy(language)["digest_subject"].format(count=len(rows))
+        if language == "ko" and len(rows) > 1:
+            title = f"{settings.channel_name} | 소식 {len(rows)}건"
+        content = localized[0][1] if len(rows) == 1 else "\n\n".join(
+            f"<b>{index}. {escape(localized_title)}</b>\n{localized_html}"
+            for index, (localized_title, localized_html) in enumerate(localized, 1)
         )
-        if not store.claim(row["id"]):
+        message = build_email(
+            sender=settings.smtp_from, recipient=row["email"], title=title,
+            telegram_html=content, invite_url=settings.telegram_invite_url,
+            unsubscribe_url=unsubscribe_url, message_id=message_id,
+            subscribe_url=f"https://t.me/{username}?start=subscribe",
+            language=language, preferences_url=f"https://t.me/{username}?start=language_{row['token']}",
+        )
+        if not store.claim_batch(delivery_ids, message_id, daily_limit=settings.mailing_daily_limit):
+            if store.delivery_status(settings)["remaining_daily_messages"] == 0:
+                break
             report.skipped += 1
             continue
         try:
             send(message)
+        except EmailDeliveryPaused:
+            store.finish_batch(delivery_ids, "queued", "smtp_paused")
+            report.paused = True
+            break
+        except EmailContentError:
+            store.finish_batch(delivery_ids, "failed", "smtp_rejected")
+            report.failed += 1
+            break
         except EmailConnectionError:
-            store.finish(row["id"], "failed", "smtp_connection")
+            store.finish_batch(delivery_ids, "failed", "smtp_connection")
             report.failed += 1
             break
         except EmailDeliveryError:
-            store.finish(row["id"], "failed", "smtp_rejected")
+            store.finish_batch(delivery_ids, "failed", "smtp_rejected")
             report.failed += 1
         except (EmailDeliveryUncertain, OSError, smtplib.SMTPException):
             # A disconnect during DATA may happen after the server accepted the message.
-            store.finish(row["id"], "uncertain", "delivery_uncertain")
+            store.finish_batch(delivery_ids, "uncertain", "delivery_uncertain")
             report.uncertain += 1
         else:
-            store.finish(row["id"], "sent")
+            store.finish_batch(delivery_ids, "sent")
             report.sent += 1
+    report.deferred = store.delivery_status(settings)["pending_recipients"]
     return report

@@ -131,6 +131,23 @@ def test_existing_imported_or_other_users_address_cannot_be_claimed(setup_bot):
         assert store.status_counts() == {"active": 2, "unsubscribed": 1}
 
 
+def test_unavailable_address_does_not_report_an_active_subscription_or_expose_owner(setup_bot):
+    settings, telegram, handler = setup_bot
+    with MailingStore(settings.database_path) as store:
+        store.subscribe("inactive@example.com")
+        token = store.db.execute("SELECT token FROM mailing_subscribers").fetchone()[0]
+        store.unsubscribe_token(token)
+        store.subscribe("other@example.com", telegram_user_id=43)
+    for email in ("inactive@example.com", "other@example.com"):
+        send(handler, f"/subscribe {email}")
+        reply = telegram.calls[-1][1]["text"]
+        assert "등록하거나 변경할 수 없습니다" in reply
+        assert "기존 가입은 유지됩니다" not in reply
+        assert email not in reply and "43" not in reply
+    with MailingStore(settings.database_path) as store:
+        assert store.status_counts() == {"active": 1, "unsubscribed": 1}
+
+
 def test_imported_mail_unsubscribe_link_requires_confirmation_and_supports_cancel(setup_bot):
     settings, telegram, handler = setup_bot
     with MailingStore(settings.database_path) as store:
@@ -151,17 +168,55 @@ def test_imported_mail_unsubscribe_link_requires_confirmation_and_supports_cance
     assert all(token not in payload["text"] for _, payload in telegram.calls)
 
 
-def test_expired_unsubscribe_confirmation_does_not_change_own_or_imported_subscription(setup_bot, monkeypatch):
+def test_unsubscribe_confirmation_survives_restart_and_preserves_the_target(setup_bot):
     settings, telegram, handler = setup_bot
-    now = [100.0]
-    monkeypatch.setattr(bot_runtime.time, "monotonic", lambda: now[0])
     with MailingStore(settings.database_path) as store:
         store.subscribe("imported@example.com")
         token = store.db.execute("SELECT token FROM mailing_subscribers").fetchone()[0]
     send(handler, "/subscribe own@example.com")
     send(handler, f"/start unsubscribe_{token}")
+    restarted = CommandHandler(settings, telegram, "our_bot")
+    send(restarted, "/unsubscribe")
+    replayed = CommandHandler(settings, telegram, "our_bot")
+    send(replayed, "/unsubscribe")
+    with MailingStore(settings.database_path) as store:
+        rows = store.db.execute("SELECT email,active FROM mailing_subscribers ORDER BY email").fetchall()
+        assert [tuple(row) for row in rows] == [("imported@example.com", 0), ("own@example.com", 1)]
+        assert store.get_pending_unsubscribe(42)[0] == token
+    assert "/cancel" in telegram.calls[-1][1]["text"]
+
+
+@pytest.mark.parametrize("command", ["/cancel", "/subscribe own@example.com"])
+def test_cancel_or_signup_clears_persisted_unsubscribe_confirmation(setup_bot, command):
+    settings, telegram, handler = setup_bot
+    with MailingStore(settings.database_path) as store:
+        store.subscribe("imported@example.com")
+        token = store.db.execute("SELECT token FROM mailing_subscribers").fetchone()[0]
+    send(handler, "/subscribe own@example.com")
+    send(handler, f"/start unsubscribe_{token}")
+    restarted = CommandHandler(settings, telegram, "our_bot")
+    send(restarted, command)
+    send(restarted, "/unsubscribe")
+    with MailingStore(settings.database_path) as store:
+        rows = store.db.execute("SELECT email,active FROM mailing_subscribers ORDER BY email").fetchall()
+        assert [tuple(row) for row in rows] == [("imported@example.com", 1), ("own@example.com", 0)]
+
+
+def test_expired_unsubscribe_confirmation_does_not_change_own_or_imported_subscription(setup_bot, monkeypatch):
+    settings, telegram, handler = setup_bot
+    now = [100.0]
+    monkeypatch.setattr(bot_runtime.time, "time", lambda: now[0])
+    with MailingStore(settings.database_path) as store:
+        store.subscribe("imported@example.com")
+        token = store.db.execute("SELECT token FROM mailing_subscribers").fetchone()[0]
+    send(handler, "/subscribe own@example.com")
+    send(handler, f"/start unsubscribe_{token}")
+    restarted = CommandHandler(settings, telegram, "our_bot")
     now[0] += 901
-    send(handler, "/unsubscribe")
+    send(restarted, "/unsubscribe")
+    assert "만료" in telegram.calls[-1][1]["text"]
+    replayed = CommandHandler(settings, telegram, "our_bot")
+    send(replayed, "/unsubscribe")
     assert "만료" in telegram.calls[-1][1]["text"]
     with MailingStore(settings.database_path) as store:
         assert store.status_counts()["active"] == 2
@@ -204,6 +259,48 @@ def test_invite_and_post_buttons_preserve_original_article(setup_bot):
     assert channel_invite_url("@our_channel") == "https://t.me/our_channel"
     assert channel_invite_url("-1001", "https://evil.example/invite") == ""
     assert mailing_signup_url('bad\" username') == ""
+
+
+def test_welcome_and_signup_provide_community_buttons_and_next_briefing_guidance(setup_bot):
+    settings, telegram, _ = setup_bot
+    settings = replace(settings, channel_id="-1001", telegram_invite_url="https://t.me/+INVITE")
+    handler = CommandHandler(settings, telegram, "our_bot")
+    send(handler, "/start")
+    welcome = telegram.calls[-1][1]
+    assert "/share" in welcome["text"]
+    assert not settings.database_path.exists()
+    send(handler, "/subscribe")
+    prompt = telegram.calls[-1][1]["text"]
+    assert "새로 게시되는 브리핑부터" in prompt
+    assert "기존 이메일 구독은 새 주소로" in prompt
+    send(handler, "person@example.com")
+    signup = telegram.calls[-1][1]
+    assert "새로 게시되는 브리핑부터" in signup["text"]
+    assert "/share" in signup["text"]
+    for payload in (welcome, signup):
+        assert payload["reply_markup"]["inline_keyboard"] == [[
+            {"text": "텔레그램 방 참여", "url": "https://t.me/+INVITE"},
+            {"text": "메일링 가입", "url": "https://t.me/our_bot?start=subscribe"},
+        ]]
+
+
+@pytest.mark.parametrize("chat_type", ["private", "group", "supergroup"])
+def test_share_provides_public_links_without_email_or_personal_unsubscribe_token(setup_bot, chat_type):
+    settings, telegram, _ = setup_bot
+    settings = replace(settings, channel_id="-1001", telegram_invite_url="https://t.me/+INVITE")
+    handler = CommandHandler(settings, telegram, "our_bot")
+    with MailingStore(settings.database_path) as store:
+        store.subscribe("private@example.com", telegram_user_id=42)
+        token = store.db.execute("SELECT token FROM mailing_subscribers").fetchone()[0]
+    send(handler, f"/share private@example.com unsubscribe_{token}", chat_type=chat_type)
+    payload = telegram.calls[-1][1]
+    assert "https://t.me/+INVITE" in payload["text"]
+    assert "https://t.me/our_bot?start=subscribe" in payload["text"]
+    assert "private@example.com" not in str(payload)
+    assert token not in str(payload)
+    assert "unsubscribe_" not in str(payload)
+    with MailingStore(settings.database_path) as store:
+        assert store.status_counts() == {"active": 1, "unsubscribed": 0}
 
 
 def test_invalid_email_does_not_expose_input_or_exception_details(setup_bot):

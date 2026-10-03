@@ -54,7 +54,14 @@ async def auto_send_mail(settings: Settings):
     try:
         await asyncio.to_thread(sync_mail_queue, settings)
         report = await asyncio.to_thread(send_mail_queue, settings)
-        log.info("메일 발송 %s건 / 실패 %s건 / 결과 불명 %s건", report.sent, report.failed, report.uncertain)
+        log.info(
+            "메일 발송 %s통 / 실패 %s통 / 결과 불명 %s통 / 대기 수신자 %s명",
+            report.sent, report.failed, report.uncertain, report.deferred,
+        )
+        if report.paused:
+            log.warning("SMTP 서버가 발송을 제한해 중단했습니다. 대기열을 유지하며 mail-status로 확인할 수 있습니다.")
+        if report.localization_failed:
+            log.warning("언어별 번역을 준비하지 못해 수신자 %s명의 발송을 보류합니다.", report.localization_failed)
         return report
     except sqlite3.Error:
         log.warning("메일 DB를 사용할 수 없어 발송을 보류합니다.")

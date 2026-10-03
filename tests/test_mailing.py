@@ -1,7 +1,10 @@
+import asyncio
+import json
 import smtplib
 from dataclasses import asdict, replace
 from datetime import UTC, datetime, timedelta
 from html import escape
+from types import SimpleNamespace
 from zipfile import ZipFile
 
 import pytest
@@ -101,6 +104,129 @@ def test_checked_sheet_import_holds_review_and_ignores_raw_or_note_addresses(tmp
         again = store.import_xlsx(path)
         assert again.imported == 0
         assert again.suppressed == 2
+
+
+def test_checked_import_uses_language_and_records_reviewed_candidate(tmp_path):
+    path = workbook(tmp_path / 'list.xlsx', {'발송 점검': [
+        ['이메일', '사용 판단', '수신 언어'],
+        ['reviewed@example.com', '기본 점검 통과', 'fr'],
+        ['held@example.com', '추가 확인', 'en'],
+    ]})
+    with MailingStore(tmp_path / 'mail.db') as store:
+        store.import_prospects([{
+            'email': 'reviewed@example.com', 'name': 'Public contact', 'organization': 'Design lab',
+            'source_url': 'https://example.com/contact', 'relevance': 'Creative computing',
+            'language_hint': 'fr', 'language_evidence': 'French official contact page',
+            'researched_at': '2026-10-03',
+        }])
+        result = store.import_xlsx(path)
+        assert result.imported == 1 and result.excluded == 1
+        assert store.language_counts() == {'fr': 1}
+        assert store.outbox_counts() == {}
+        candidate = store.db.execute('SELECT status,consent FROM mailing_prospects').fetchone()
+        assert tuple(candidate) == ('imported', 'unknown')
+
+
+def test_reimport_preserves_language_choice_and_unsubscription(tmp_path):
+    path = workbook(tmp_path / 'list.xlsx', {'Contacts': [
+        ['이메일', '사용 판단', '수신 언어'],
+        ['current@example.com', '기본 점검 통과', 'ko'],
+        ['unsubscribed@example.com', '기본 점검 통과', 'en'],
+    ]})
+    with MailingStore(tmp_path / 'mail.db') as store:
+        store.subscribe('current@example.com', 1, language='de')
+        store.subscribe('unsubscribed@example.com', 2, language='ja')
+        store.unsubscribe_user(2)
+        result = store.import_xlsx(path)
+        assert result.duplicates == 1 and result.suppressed == 1 and result.imported == 0
+        assert store.get_language(1) == 'de'
+        assert store.get_language(2) is None
+        assert store.status_counts() == {'active': 1, 'unsubscribed': 1}
+
+
+def test_import_rejects_unknown_language_without_defaulting_to_korean(tmp_path):
+    path = workbook(tmp_path / 'list.xlsx', {'연락처': [
+        ['이메일', '수신 언어'],
+        ['bad-language@example.com', 'klingon'],
+        ['english@example.com', 'en-US'],
+        ['default@example.com', ''],
+    ]})
+    with MailingStore(tmp_path / 'mail.db') as store:
+        result = store.import_xlsx(path)
+        assert result.invalid == 1 and result.imported == 2
+        assert store.language_counts() == {'en': 1, 'ko': 1}
+
+
+def test_admin_address_edit_preserves_owner_and_language_without_forwarding_old_queue(tmp_path):
+    with MailingStore(tmp_path / 'mail.db') as store:
+        store.subscribe('old@example.com', 1, language='fr')
+        store.store_post('previous', 'Previous', 'Queued to the previous address')
+        old = dict(store.db.execute('SELECT * FROM mailing_subscribers').fetchone())
+        assert store.edit_subscriber('old@example.com', new_email='new@example.com')
+        current = store.db.execute("SELECT * FROM mailing_subscribers WHERE email='new@example.com'").fetchone()
+        assert current['telegram_user_id'] == 1 and current['language'] == 'fr'
+        assert current['created_at'] > old['created_at'] and current['token'] != old['token']
+        assert store.get_language_token(old['token']) is None
+        assert store.outbox_counts() == {'suppressed': 1}
+        store.store_post('historical', 'Historical', 'Before address change', published_at=old['created_at'])
+        assert store.outbox_counts() == {'suppressed': 1}
+        store.store_post('future', 'Future', 'After address change')
+        queued = store.db.execute("SELECT email FROM mailing_outbox WHERE status='queued'").fetchall()
+        assert [row['email'] for row in queued] == ['new@example.com']
+
+
+@pytest.mark.parametrize('existing_active', [True, False])
+def test_admin_address_collision_is_atomic_and_does_not_bypass_unsubscribe(tmp_path, existing_active):
+    with MailingStore(tmp_path / 'mail.db') as store:
+        store.subscribe('old@example.com', 1, language='fr')
+        store.subscribe('existing@example.com', 2, language='en')
+        if not existing_active:
+            store.unsubscribe_user(2)
+        store.store_post('queued', 'Queued', 'Pending content')
+        before_members = [tuple(row) for row in store.db.execute('SELECT * FROM mailing_subscribers ORDER BY email')]
+        before_queue = [tuple(row) for row in store.db.execute('SELECT * FROM mailing_outbox ORDER BY id')]
+        with pytest.raises(ValueError):
+            store.edit_subscriber('old@example.com', new_email='existing@example.com')
+        assert [tuple(row) for row in store.db.execute('SELECT * FROM mailing_subscribers ORDER BY email')] == before_members
+        assert [tuple(row) for row in store.db.execute('SELECT * FROM mailing_outbox ORDER BY id')] == before_queue
+
+
+def test_admin_remove_cancels_unsent_queue_and_reimport_cannot_restore_it(tmp_path):
+    path = workbook(tmp_path / 'list.xlsx', {'Contacts': [['Email'], ['old@example.com']]})
+    with MailingStore(tmp_path / 'mail.db') as store:
+        store.subscribe('old@example.com', language='de')
+        for index, status in enumerate(('queued', 'failed', 'sent', 'uncertain')):
+            store.store_post(str(index), 'Content', 'Content')
+            if status != 'queued':
+                store.db.execute('UPDATE mailing_outbox SET status=? WHERE post_key=?', (status, str(index)))
+        store.db.commit()
+        assert store.remove_subscriber('old@example.com')
+        assert not store.remove_subscriber('old@example.com')
+        assert store.outbox_counts() == {'suppressed': 2, 'sent': 1, 'uncertain': 1}
+        result = store.import_xlsx(path)
+        assert result.suppressed == 1 and result.imported == 0
+        assert store.status_counts() == {'active': 0, 'unsubscribed': 1}
+        store.store_post('future', 'Future', 'New content')
+        assert store.outbox_counts() == {'suppressed': 2, 'sent': 1, 'uncertain': 1}
+
+
+def test_admin_edit_and_remove_cli_apply_without_exposing_contacts(tmp_path, capsys):
+    from compdesign_bot.cli import dispatch
+
+    settings = Settings(database_path=tmp_path / 'mail.db')
+    with MailingStore(settings.database_path) as store:
+        store.subscribe('old@example.com', language='ko')
+        original = dict(store.db.execute('SELECT * FROM mailing_subscribers').fetchone())
+    asyncio.run(dispatch(SimpleNamespace(command='mail-edit', email='old@example.com',
+                                        new_email=None, language='en'), settings))
+    assert json.loads(capsys.readouterr().out) == {'updated': True}
+    with MailingStore(settings.database_path) as store:
+        updated = dict(store.db.execute('SELECT * FROM mailing_subscribers').fetchone())
+        assert updated == {**original, 'language': 'en'}
+    asyncio.run(dispatch(SimpleNamespace(command='mail-remove', email='old@example.com'), settings))
+    assert json.loads(capsys.readouterr().out) == {'removed_from_active_list': True}
+    with MailingStore(settings.database_path) as store:
+        assert store.status_counts() == {'active': 0, 'unsubscribed': 1}
 
 
 def test_xlsx_shared_strings_and_mailto_hyperlinks(tmp_path):

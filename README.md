@@ -97,6 +97,9 @@ python -m compdesign_bot run
 | `/latest` | 한국어 브리핑 최대 3건 |
 | `/tools` | 추천 GitHub 저장소·활용법·문서와 예제 |
 | `/sources` | 수집원 안내 |
+| `/subscribe` / `/unsubscribe` | 이메일 브리핑 가입·수신 해지 |
+| `/invite` / `/share` | 방 참여·친구에게 공유할 가입 링크 |
+| `/language` | 본인 이메일의 수신 언어 선택 |
 
 `/latest`는 최근 결과를 최대 1시간 캐시해 사용합니다. 같은 대화의 요청 간격은 최소 60초이며, 새 피드 수집에도 공통 대기 시간이 있어 연속 요청이 새 수집으로 이어지지는 않습니다. 자유 대화형 질의응답 기능은 포함하지 않습니다.
 
@@ -171,8 +174,10 @@ GitHub에서는 Art Blocks, onchfs, COMPAS, p5.js, NVIDIA Warp의 공식 릴리�
 
 ### 이메일 브리핑과 텔레그램 가입
 
-채널에 게시한 동일한 브리핑을 수신자별 개별 메일로 보낼 수 있습니다. 메일에는 원문,
-텔레그램 방 초대 링크, 개인별 수신 해지 링크가 포함됩니다. 주소는 다른 수신자에게 공개되지 않습니다.
+채널에 게시한 여러 소식을 수신자별 묶음 메일로 보냅니다. 메일에는 원문,
+텔레그램 방 초대 링크, 공개 이메일 가입 링크, 개인별 수신 해지 링크가 포함됩니다.
+주소는 다른 수신자에게 공개되지 않습니다. 친구에게는 공개 가입 링크를 공유하세요.
+개인 수신 해지 링크는 자신의 구독을 관리하는 링크입니다.
 
 ```bash
 python -m compdesign_bot mail-import research_mailing_list_checked.xlsx
@@ -181,12 +186,17 @@ python -m compdesign_bot mail-status
 
 `발송 점검` 시트가 있으면 `기본 점검 통과` 주소만 가져오고 `추가 확인` 주소는 보류합니다.
 중복은 한 번만 등록하고, 해지한 주소는 엑셀을 다시 가져와도 재가입되지 않습니다.
+`수신 언어` 열이 있으면 새 주소의 언어로 적용합니다. 기존 구독자의 언어 선택은 다시 가져와도 유지합니다.
 메일링 목록과 발송 기록은 기존 `DATABASE_PATH`에 저장하며, 개인정보가 있는 XLSX는 Git과 Docker 이미지에서 제외합니다.
+통합 관리 파일은 `research_mailing_list_checked.xlsx`입니다. `연락처`에는 기존 주소와 재검토를 통과한 추가 주소를,
+`발송 점검`에는 사용 판단·수신 언어·출처를 기록합니다. 보류나 제외 대상은 발송 대상으로 가져오지 않습니다.
 
 `.env`에 다음 값을 설정하세요. `SMTP_FROM`에는 표시 이름 없이 이메일 주소만 입력합니다.
 
 ```dotenv
 MAILING_ENABLED=true
+MAILING_BATCH_LIMIT=200
+MAILING_DAILY_LIMIT=400
 SMTP_HOST=smtp.example.com
 SMTP_PORT=587
 SMTP_SECURITY=starttls
@@ -202,15 +212,42 @@ TELEGRAM_INVITE_URL=https://t.me/ComputationalDesignKorea
 메일 설정이 없어도 텔레그램 게시와 구독 등록은 동작하며, `MAILING_ENABLED=true`인 경우 메일은 대기열에 남습니다.
 설정을 바꾼 뒤 실행 중인 봇을 재시작하세요. Docker는 `docker compose up -d --force-recreate bot`을 사용합니다.
 
+기본 상한은 한 번에 200통, 최근 24시간에 400통입니다. 게시물 수가 아니라 실제 묶음 메일 통수를 셉니다.
+예를 들어 구독자 184명에게 소식 10개를 전하면 기본적으로 메일 184통을 보냅니다.
+긴 대기열은 메일당 최대 20개 소식 또는 본문 약 60KB씩 나눕니다.
+상한을 넘은 수신자는 대기열에 남아 다음 예약 발행 때 처리됩니다.
+전송 성공 여부가 불명확한 메일도 24시간 한도를 예약하므로 중복 발송을 피하면서 상한을 지킵니다.
+Gmail의 [공식 발송 한도 안내](https://support.google.com/mail/answer/22839?hl=en)를 참고하세요.
+400통은 이 프로그램의 상한이며, 같은 계정에서 다른 앱으로 보낸 메일까지 계산하지는 않습니다.
+`mail-status`의 `delivery`에는 대기 수신자, 실제 발송 통수, 미확인 예약 통수, 남은 한도가 표시됩니다.
+
 텔레그램 봇 개인 대화에서 `/subscribe`를 누르고 본인 이메일을 보내거나
 `/subscribe name@example.com`으로 가입합니다. `/unsubscribe`로 본인 구독을 해지하고,
 `/cancel`로 주소 입력을 취소하며, `/invite`로 방 초대 링크를 확인합니다.
+`/share`는 친구에게 전달할 공개 방·메일링 가입 링크를 보여줍니다.
+새 가입은 다음에 게시하는 브리핑부터 적용됩니다. 다른 이메일을 등록하면 이 계정의 기존 구독 주소가 바뀝니다.
 엑셀로 등록된 수신자는 메일의 해지 링크로 봇을 열고 `/unsubscribe`로 확인합니다.
+해지 확인 대상은 재시작 후에도 유지됩니다. 다른 구독을 관리하려면 `/cancel`로 확인을 종료하세요.
+주소를 변경하면 이전 주소의 대기 메일을 취소하고 수신 언어는 유지합니다.
+서로 다른 메일의 언어 설정·해지 링크를 관리 중일 때는 다른 구독을 임의로 변경하지 않습니다.
 명령어 메뉴는 `python -m compdesign_bot configure-bot`으로 갱신합니다.
+
+운영자는 서버에서 아래 명령으로 활성 목록을 수정하거나 제외할 수 있습니다.
+주소 변경은 이전 수신 기록을 보존하고 이후 발행분부터 새 주소에 적용하며, 이미 등록·해지된 주소로 덮어쓰지 않습니다.
+목록 제외는 대기·실패 메일을 취소하고 해지 기록을 남겨 엑셀 재가져오기에서 재등록되는 것을 막습니다.
+엑셀 행을 삭제하는 것만으로 운영 DB의 구독이 해지되지는 않습니다. 본인의 봇 해지나 `mail-remove`를 사용하세요.
+
+```bash
+python -m compdesign_bot mail-edit old@example.com --email new@example.com
+python -m compdesign_bot mail-edit new@example.com --language en
+python -m compdesign_bot mail-remove new@example.com
+```
 
 `publish` 및 예약 발행은 게시 성공한 글을 메일 대기열에도 기록합니다.
 미리보기와 `/latest` 요청은 메일을 발송하지 않습니다. 가입 시점 이전의 모든 과거 글을 소급 발송하지 않습니다.
 전송 성공 여부가 불명확하거나 실패한 메일은 자동 반복 발송하지 않습니다.
+서버가 일시 제한이나 발송 한도 초과를 명시하면 해당 묶음은 대기로 돌리고 나머지 발송도 중단합니다.
+`mail-status`의 `paused_recipients`로 확인할 수 있으며 다음 예약 발행에서 다시 시도합니다.
 SMTP 제공업체의 전송 기록을 확인한 후 아래 명령으로 처리하세요.
 
 ```bash
@@ -220,6 +257,41 @@ python -m compdesign_bot resolve-mail-delivery 123 --sent
 python -m compdesign_bot resolve-mail-delivery 123 --retry
 python -m compdesign_bot mail-send
 ```
+
+`resolve-mail-delivery`는 선택한 ID와 같은 묶음 메일의 기록을 함께 처리합니다.
+코드를 변경했다면 `docker compose up -d --build --force-recreate bot`으로 반영하세요.
+
+### 공개 연락처 후보와 수신 언어
+
+공식 사이트의 공개 업무 연락처는 출처·관련 분야·언어 근거와 함께 별도 후보 목록에 저장합니다.
+후보 등록만으로 활성 구독자가 되거나 메일을 받지는 않습니다. 기존 가입·수신 해지 주소와 중복된 후보는 제외합니다.
+본인이 `/subscribe`로 가입하면 후보 상태가 `subscribed`로 바뀌고 이후 게시물부터 발송 대상에 포함됩니다.
+운영자가 출처·관련성·연락 목적을 재검토해 통합 엑셀의 발송 기준 통과 행으로 편입한 주소는
+`mail-import`로 등록하며 후보 상태는 `imported`가 됩니다. 이 상태를 본인의 수신 동의로 기록하지는 않습니다.
+
+```bash
+python -m compdesign_bot mail-prospects-import data/mailing/prospects-reviewed-20261003.json
+python -m compdesign_bot mail-status
+```
+
+후보 JSON은 `name`, `organization`, `email`, `source_url`(공식 HTTPS 페이지), `relevance`,
+`language_hint`, `language_evidence`, `researched_at` 필드가 있는 객체 배열입니다.
+공개 페이지의 주 사용 언어는 제안값이며 개인의 선호 언어를 확인한 것은 아닙니다.
+후보 연락처 파일은 `data/`에 보관하며 Git과 Docker 이미지에서 제외합니다.
+
+수신 언어는 한국어(`ko`), 영어(`en`), 일본어(`ja`), 중국어 간체(`zh`), 독일어(`de`),
+프랑스어(`fr`), 스페인어(`es`), 포르투갈어(`pt`), 한국어·영어 병기(`bilingual`)를 지원합니다.
+새 봇 가입은 한영 병기를 기본으로 하고, 기존 목록은 한국어 설정을 유지합니다.
+재가입할 때는 이전 언어를 유지합니다. 봇 개인 대화에서 `/language en`처럼 변경하세요.
+엑셀 등으로 가입한 수신자는 받은 메일의 **메일 언어 설정** 링크를 열어 변경합니다.
+이 링크의 확인 대상은 재시작 후에도 유지되고 15분 뒤 만료됩니다.
+언어를 바꿔도 해지된 구독이 활성화되거나 이미 보낸 메일이 재발송되지는 않습니다.
+
+제목·기사 본문·참여 및 해지 안내를 선택 언어로 제공합니다. 외국어 본문은 현재 설정된 Gemini로 번역합니다.
+동일 게시물·언어의 번역은 캐시해 여러 수신자에게 재사용하고, 수신자 주소나 개인 관리 링크는 번역 API로 보내지 않습니다.
+번역에 실패하면 해당 수신자의 메일을 대기로 남기며 다른 한국어 발송은 진행할 수 있습니다.
+로컬 번역 모드에서는 외국어 본문을 준비하지 못하므로 대기로 남깁니다. 공급자를 자동 전환하지 않습니다.
+`mail-status`는 활성 언어별 수신자 수와 후보 상태도 표시합니다. 번역문에는 오역이 있을 수 있으므로 원문 링크를 함께 제공합니다.
 
 Docker에서는 XLSX를 이미지에 넣지 않고 일회성으로 읽기 전용 마운트하여 가져옵니다.
 

@@ -110,6 +110,18 @@ async def doctor(settings: Settings):
 
         print(f"관심 GitHub 저장소: {sum(r.enabled for r in load_repositories(settings.repositories_file))}개")
     print(f"예약: {', '.join(t.strftime('%H:%M') for t in settings.post_times)} ({settings.timezone})")
+    if settings.mailing_enabled:
+        try:
+            settings.require_mail()
+            if not settings.bot_username or not settings.telegram_invite_url:
+                raise ValueError("TELEGRAM_BOT_USERNAME과 TELEGRAM_INVITE_URL 설정이 필요합니다.")
+        except ValueError as error:
+            print(f"메일 자동 발송 준비 대기: {error}")
+        else:
+            print("메일 자동 발송 설정 준비 완료. 실제 SMTP 연결은 확인하지 않았습니다.")
+    else:
+        print("메일 자동 발송: 꺼짐 (MAILING_ENABLED=false)")
+    print(f"메일 발송 상한: 한 번에 {settings.mailing_batch_limit}통 / 최근 24시간 {settings.mailing_daily_limit}통")
     async with httpx.AsyncClient() as client:
         bot = Telegram(client, settings.bot_token, settings.channel_id)
         me = await bot.call("getMe")
@@ -136,7 +148,7 @@ async def configure_bot(settings: Settings):
         "온체인 생성 예술, AI 디자인 도구, 파라메트릭 디자인, 크리에이티브 코딩 소식을 "
         "논문·투자 및 지원 소식·작품과 실험까지 한국어 발췌·번역과 원문 링크로 확인하세요.\n\n"
         "/latest 최신 브리핑\n/subscribe 메일링 가입\n/unsubscribe 메일링 해지\n"
-        "/invite 방 초대 링크\n/tools 추천 GitHub 도구\n/help 이용 안내"
+        "/invite 방 초대 링크\n/share 방·메일링 공유\n/language 메일 언어 선택\n/tools 추천 GitHub 도구\n/help 이용 안내"
     )
     commands = [
         {"command": command, "description": text}
@@ -148,6 +160,8 @@ async def configure_bot(settings: Settings):
             ("subscribe", "이메일로 브리핑 받기"),
             ("unsubscribe", "메일링 리스트 수신 해지"),
             ("invite", "텔레그램 방 초대 링크"),
+            ("share", "텔레그램 방과 메일링 가입 링크 공유"),
+            ("language", "메일 언어 선택 / Email language"),
             ("cancel", "메일 주소 입력 취소"),
             ("help", "이용 안내와 채널 연결 방법"),
         )
@@ -204,13 +218,16 @@ async def discover_channel(settings: Settings):
 
 
 async def dispatch(args, settings: Settings):
-    if args.command in {"mail-import", "mail-status", "mail-send", "resolve-mail-delivery"}:
+    if args.command in {"mail-import", "mail-status", "mail-send", "resolve-mail-delivery", "mail-prospects-import",
+                        "mail-edit", "mail-remove"}:
         from .mail_delivery import send_mail_queue, sync_mail_queue
         from .mailing import MailingStore
 
         if args.command == "mail-send":
             report = await asyncio.to_thread(send_mail_queue, settings)
             print(json.dumps(asdict(report), ensure_ascii=False, indent=2))
+            if report.paused:
+                raise RuntimeError("SMTP 서버가 발송을 제한해 중단했습니다. 대기열은 유지됩니다. mail-status로 확인하세요.")
             if report.failed or report.uncertain:
                 raise RuntimeError("메일 전송 실패 또는 결과 불명 기록이 있습니다. mail-status로 확인하세요.")
             return
@@ -224,14 +241,29 @@ async def dispatch(args, settings: Settings):
                     if not path:
                         raise ValueError("XLSX 파일 경로 또는 MAILING_XLSX_PATH를 지정하세요.")
                     print(json.dumps(asdict(mail.import_xlsx(path)), ensure_ascii=False, indent=2))
+                elif args.command == "mail-prospects-import":
+                    records = json.loads(args.json_path.read_text(encoding="utf-8"))
+                    if not isinstance(records, list) or any(not isinstance(row, dict) for row in records):
+                        raise ValueError("후보 JSON은 연락처 객체 배열이어야 합니다.")
+                    print(json.dumps(asdict(mail.import_prospects(records)), ensure_ascii=False, indent=2))
                 elif args.command == "mail-status":
                     print(json.dumps({
                         "subscribers": mail.status_counts(), "outbox": mail.outbox_counts(),
+                        "delivery": mail.delivery_status(settings),
+                        "languages": mail.language_counts(), "prospects": mail.prospect_counts(),
                         "unresolved": mail.unresolved(),
                     }, ensure_ascii=False, indent=2))
+                elif args.command == "mail-edit":
+                    changed = mail.edit_subscriber(args.email, new_email=args.new_email, language=args.language)
+                    print(json.dumps({"updated": changed}))
+                elif args.command == "mail-remove":
+                    print(json.dumps({"removed_from_active_list": mail.remove_subscriber(args.email)}))
                 else:
                     mail.resolve(args.id, retry=args.retry)
-                    print("메일 재시도를 허용했습니다." if args.retry else "메일 발송 완료로 기록했습니다.")
+                    print(
+                        "해당 메일에 묶인 발송 기록의 재시도를 허용했습니다."
+                        if args.retry else "해당 메일에 묶인 발송 기록을 발송 완료로 기록했습니다."
+                    )
             finally:
                 mail.close()
     elif args.command == "collect":
@@ -328,10 +360,18 @@ def main():
     sub.add_parser("status", help="발행 기록과 미확인 전송 보기")
     p = sub.add_parser("mail-import", help="XLSX 메일 목록 가져오기 (중복·수신 해지 제외)")
     p.add_argument("xlsx", type=Path, nargs="?")
+    p = sub.add_parser("mail-prospects-import", help="공개 업무 연락처 후보 가져오기 (자동 구독·발송 없음)")
+    p.add_argument("json_path", type=Path)
     sub.add_parser("mail-status", help="메일 구독자 수와 발송 대기·실패 기록 확인")
     sub.add_parser("mail-send", help="대기 중인 브리핑 메일 발송 (텔레그램 재발행 없음)")
-    p = sub.add_parser("resolve-mail-delivery", help="SMTP 확인 후 미확인·실패 메일 기록 처리")
-    p.add_argument("id", type=int)
+    p = sub.add_parser("mail-edit", help="활성 구독자의 이메일·수신 언어 수정")
+    p.add_argument("email", help="현재 이메일 주소")
+    p.add_argument("--email", dest="new_email", help="변경할 이메일 주소")
+    p.add_argument("--language", help="수신 언어 (ko, en, ja, zh, de, fr, es, pt, bilingual)")
+    p = sub.add_parser("mail-remove", help="활성 목록에서 제외하고 대기 메일 취소 (재등록 방지 기록 유지)")
+    p.add_argument("email", help="제외할 이메일 주소")
+    p = sub.add_parser("resolve-mail-delivery", help="SMTP 확인 후 동일 메일에 묶인 미확인·실패 기록 함께 처리")
+    p.add_argument("id", type=int, help="mail-status의 기록 ID; 동일 메일에 묶인 기록을 함께 처리")
     group = p.add_mutually_exclusive_group(required=True)
     group.add_argument("--retry", action="store_true", help="미전송을 확인한 메일만 재시도 허용")
     group.add_argument("--sent", action="store_true", help="발송 완료로 표시")

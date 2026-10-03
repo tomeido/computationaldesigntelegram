@@ -49,6 +49,8 @@ class Settings:
     telegram_invite_url: str = ""
     mailing_enabled: bool = False
     mailing_xlsx_path: Path | None = None
+    mailing_batch_limit: int = 200
+    mailing_daily_limit: int = 400
     smtp_host: str = ""
     smtp_port: int = 587
     smtp_username: str = field(default="", repr=False)
@@ -57,6 +59,12 @@ class Settings:
     smtp_security: str = "starttls"
 
     def __post_init__(self) -> None:
+        for name, value, upper in (
+            ("MAILING_BATCH_LIMIT", self.mailing_batch_limit, 1000),
+            ("MAILING_DAILY_LIMIT", self.mailing_daily_limit, 10000),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= upper:
+                raise ValueError(f"{name}: 1~{upper} 범위의 정수를 입력하세요.")
         if self.smtp_security not in {"starttls", "ssl"}:
             raise ValueError("SMTP_SECURITY: starttls 또는 ssl을 입력하세요.")
         if not 1 <= self.smtp_port <= 65535:
@@ -125,6 +133,8 @@ class Settings:
                 Path(os.environ["MAILING_XLSX_PATH"].strip())
                 if os.getenv("MAILING_XLSX_PATH", "").strip() else None
             ),
+            mailing_batch_limit=_integer("MAILING_BATCH_LIMIT", 200, 1, 1000),
+            mailing_daily_limit=_integer("MAILING_DAILY_LIMIT", 400, 1, 10000),
             smtp_host=os.getenv("SMTP_HOST", "").strip(),
             smtp_port=_integer("SMTP_PORT", 587, 1, 65535),
             smtp_username=os.getenv("SMTP_USERNAME", "").strip(),

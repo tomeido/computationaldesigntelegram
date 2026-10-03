@@ -22,6 +22,7 @@ import httpx
 from .config import Settings
 from .feeds import load_sources
 from .github_sources import load_repositories
+from .mail_localization import LANGUAGE_NAMES, normalize_language
 from .mailing import MailingStore
 from .pipeline import run_digest
 from .resources import public_resource_url
@@ -144,7 +145,6 @@ class CommandHandler:
         self.cached_messages: list[str] | None = None
         self.cached_at = float("-inf")
         self.last_fetch_at = float("-inf")
-        self.pending_unsubscribes: OrderedDict[int, tuple[str, float]] = OrderedDict()
         self.invite_url = channel_invite_url(settings.channel_id, settings.telegram_invite_url)
         self.subscribe_url = mailing_signup_url(username)
 
@@ -169,7 +169,9 @@ class CommandHandler:
             "/tools — 추천 GitHub 도구와 활용법\n"
             "/sources — 수집 출처\n"
             "/invite — 텔레그램 방 초대 링크\n"
+            "/share — 친구에게 공유할 방·메일링 가입 링크\n"
             "/subscribe — 이메일 브리핑 가입\n"
+            "/language — 이메일 수신 언어 선택\n"
             "/unsubscribe — 이메일 브리핑 수신 거부\n"
             "/cancel — 이메일 입력·수신 거부 취소\n"
             "/help — 이용 안내\n\n"
@@ -187,6 +189,10 @@ class CommandHandler:
                 "운영자가 채널 ID를 설정하면 예약 브리핑이 시작됩니다. "
                 "봇 토큰만으로 채널을 새로 만들 수는 없습니다."
             )
+        text += (
+            "\n\nEmail briefings: /subscribe. Choose your email language with /language en "
+            "(ko, en, ja, zh, de, fr, es, pt, bilingual)."
+        )
         return text
 
     async def _invite(self, chat_id: int) -> None:
@@ -197,49 +203,177 @@ class CommandHandler:
         else:
             await self._reply(chat_id, "방 초대 링크가 아직 설정되지 않았습니다. 운영자에게 확인해 주세요.")
 
+    async def _share(self, chat_id: int) -> None:
+        reply = (
+            f"<b>{escape(self.settings.channel_name[:100])}</b>\n"
+            "Web3·AI·컴퓨테이셔널 디자인 소식을 한국어 핵심과 원문 링크로 받아보세요.\n"
+            "친구에게 아래 가입 링크를 공유해 주세요.\n"
+        )
+        if self.invite_url:
+            reply += (
+                f'\n텔레그램 방 참여: <a href="{escape(self.invite_url, quote=True)}">'
+                f"{escape(self.invite_url)}</a>"
+            )
+        if self.subscribe_url:
+            reply += (
+                f'\n이메일 브리핑 가입: <a href="{escape(self.subscribe_url, quote=True)}">'
+                f"{escape(self.subscribe_url)}</a>"
+            )
+        await self._reply(chat_id, reply, post=True)
+
     async def _subscribe(self, user_id: int, email: str = "") -> None:
-        self.pending_unsubscribes.pop(user_id, None)
+        subscribed = False
         with MailingStore(self.settings.database_path) as store:
+            store.pop_pending_unsubscribe(user_id)
+            store.clear_pending_language(user_id)
             if not email:
                 store.set_awaiting_email(user_id, True)
                 reply = (
                     "Computational Web3 브리핑을 받을 본인의 이메일 주소를 이 개인 대화에 입력해 주세요.\n"
                     "주소를 보내면 브리핑 이메일 수신에 동의하며, /unsubscribe로 언제든 수신을 중단할 수 있습니다.\n"
-                    "가입을 취소하려면 /cancel을 입력하세요."
+                    "가입 이후 새로 게시되는 브리핑부터 보내드립니다.\n"
+                    "다른 이메일을 등록하면 이 계정의 기존 이메일 구독은 새 주소로 바뀝니다.\n"
+                    "가입을 취소하려면 /cancel을 입력하세요.\n\n"
+                    "Send your own email here to subscribe. Sending your address opts you in; "
+                    "/unsubscribe stops emails and /cancel cancels signup.\n"
+                    "New subscribers receive Korean + English. After signup, choose a language with /language en."
                 )
             else:
                 try:
-                    result = store.subscribe(email, telegram_user_id=user_id)
+                    language = store.get_language(user_id) or "bilingual"
+                    result = store.subscribe(email, telegram_user_id=user_id, language=language)
                 except ValueError:
                     store.set_awaiting_email(user_id, True)
                     reply = "이메일 주소 하나를 정확히 입력해 주세요. 예: name@example.com\n취소: /cancel"
                 else:
                     store.set_awaiting_email(user_id, False)
                     if result == "subscribed":
-                        reply = "메일링 리스트에 가입했습니다. /unsubscribe로 언제든 수신을 중단할 수 있습니다."
+                        subscribed = True
+                        reply = (
+                            "메일링 리스트에 가입했습니다. 가입 이후 새로 게시되는 브리핑부터 보내드립니다.\n"
+                            "이 계정의 기존 이메일 구독이 있었다면 새 주소로 바뀌었습니다.\n"
+                            "/unsubscribe로 언제든 수신을 중단할 수 있습니다.\n"
+                            "친구에게 가입 링크를 알려주려면 /share를 입력하세요."
+                        )
+                        language = store.get_language(user_id) or "bilingual"
+                        reply += (
+                            f"\n수신 언어 / Email language: {escape(LANGUAGE_NAMES[language])}\n"
+                            "다른 언어 선택 / Change language: /language en (한국어: /language ko).\n"
+                            "Subscribed. You will receive new briefings after signup; /unsubscribe stops emails."
+                        )
                         if (
                             not self.settings.mailing_enabled
                             or not self.settings.smtp_host
                             or not self.settings.smtp_from
                         ):
                             reply += "\n메일 발송 준비가 완료되면 새 브리핑을 보내드립니다."
+                    elif result == "email_in_use":
+                        reply = (
+                            "이 주소로는 이 계정의 구독을 등록하거나 변경할 수 없습니다.\n"
+                            "기존 수신 상태는 바뀌지 않았습니다. 본인의 다른 이메일 주소로 /subscribe를 입력해 주세요.\n"
+                            "수신 거부는 받은 메일의 링크를 이용하세요."
+                        )
                     else:
                         reply = (
                             "이미 등록된 이메일입니다. 기존 가입은 유지됩니다.\n"
-                            "이 계정에서 가입했다면 /unsubscribe, 그렇지 않다면 받은 메일의 수신 거부 링크를 이용하세요."
+                            "이 계정에서 가입했다면 /unsubscribe, 그렇지 않다면 받은 메일의 수신 거부 링크를 이용하세요.\n"
+                            "수신 언어 선택 / Choose email language: /language."
                         )
+        await self._reply(user_id, reply, post=subscribed)
+
+    @staticmethod
+    def _language_choices() -> str:
+        return "\n".join(f"/language {code} — {escape(name)}" for code, name in LANGUAGE_NAMES.items())
+
+    async def _language(self, user_id: int, argument: str = "") -> None:
+        if argument:
+            try:
+                language = normalize_language(argument)
+            except ValueError:
+                await self._reply(
+                    user_id,
+                    "지원하는 언어 코드 하나를 입력하세요. / Enter one supported language code.\n"
+                    + self._language_choices(),
+                )
+                return
+        else:
+            language = ""
+        with MailingStore(self.settings.database_path) as store:
+            pending = store.get_pending_language(user_id)
+            if pending is None and store.get_pending_unsubscribe(user_id) is not None:
+                reply = (
+                    "현재 메일의 수신 거부를 확인 중입니다. 언어 변경은 해당 메일의 언어 설정 링크를 열어 주세요.\n"
+                    "본인 구독을 관리하려면 /cancel로 확인을 종료하세요.\n"
+                    "Open the language link in that email, or use /cancel to manage your own subscription."
+                )
+            elif pending is not None and time.time() - pending[1] > 900:
+                reply = (
+                    "언어 설정 확인 시간이 만료되었습니다. 받은 메일의 언어 설정 링크를 다시 열어 주세요.\n"
+                    "Language link expired. Reopen the language link in your email.\n"
+                    "다른 구독 관리 / Manage another subscription: /cancel."
+                )
+            else:
+                current = store.get_language_token(pending[0]) if pending else store.get_language(user_id)
+                if current is None:
+                    reply = (
+                        "설정할 활성 이메일 구독을 확인하지 못했습니다. / No active email subscription found.\n"
+                        "가입하려면 /subscribe, 엑셀 등으로 등록했다면 받은 메일의 언어 설정 링크를 이용하세요.\n"
+                        "Use /subscribe, or open the language link in your email.\n\n"
+                        + self._language_choices()
+                    )
+                elif not language:
+                    reply = (
+                        f"수신 언어 / Current email language: {escape(LANGUAGE_NAMES[current])}\n\n"
+                        "수신 언어를 선택하세요. / Choose your email language.\n"
+                        + self._language_choices()
+                    )
+                else:
+                    changed = (
+                        store.set_language_token(pending[0], language)
+                        if pending else store.set_language(user_id, language)
+                    )
+                    if changed:
+                        reply = (
+                            f"수신 언어를 설정했습니다. / Email language set: {escape(LANGUAGE_NAMES[language])}\n"
+                            "다음 메일부터 적용됩니다. / Applies to future emails."
+                        )
+                        if pending:
+                            reply += "\n다른 구독 관리 / Manage another subscription: /cancel."
+                    else:
+                        reply = "활성 이메일 구독을 확인하지 못했습니다. / No active email subscription found."
         await self._reply(user_id, reply)
 
-    async def _unsubscribe(self, user_id: int) -> None:
-        pending = self.pending_unsubscribes.pop(user_id, None)
+    async def _start_language(self, user_id: int, token: str) -> None:
         with MailingStore(self.settings.database_path) as store:
             store.set_awaiting_email(user_id, False)
-            if pending is not None:
+            store.pop_pending_unsubscribe(user_id)
+            store.set_pending_language(user_id, token, time.time())
+        await self._language(user_id)
+
+    async def _unsubscribe(self, user_id: int) -> None:
+        with MailingStore(self.settings.database_path) as store:
+            # Keep the target until cancelled or changed: a replay after a restart
+            # must not fall through to a different, account-linked mailbox.
+            pending = store.get_pending_unsubscribe(user_id)
+            store.set_awaiting_email(user_id, False)
+            if pending is None and store.get_pending_language(user_id) is not None:
+                reply = (
+                    "현재 메일의 언어 설정 중입니다. 수신 거부는 해당 메일의 수신 거부 링크를 열어 주세요.\n"
+                    "본인 구독을 관리하려면 /cancel로 확인을 종료하세요.\n"
+                    "Open the unsubscribe link in that email, or use /cancel to manage your own subscription."
+                )
+            elif pending is not None:
                 token, created_at = pending
-                if time.monotonic() - created_at > 900:
-                    reply = "확인 시간이 만료되었습니다. 메일의 수신 거부 링크를 다시 열어 주세요."
+                if time.time() - created_at > 900:
+                    reply = (
+                        "확인 시간이 만료되었습니다. 메일의 수신 거부 링크를 다시 열어 주세요.\n"
+                        "다른 구독을 관리하려면 /cancel로 확인을 종료하세요."
+                    )
                 elif store.unsubscribe_token(token):
-                    reply = "이메일 브리핑 수신을 중단했습니다."
+                    reply = (
+                        "이메일 브리핑 수신을 중단했습니다.\n"
+                        "다른 구독을 관리하려면 /cancel로 확인을 종료하세요."
+                    )
                 else:
                     reply = "유효한 수신 거부 링크를 확인하지 못했습니다. 받은 메일의 링크를 다시 확인해 주세요."
             elif store.unsubscribe_user(user_id):
@@ -254,18 +388,17 @@ class CommandHandler:
     async def _start_unsubscribe(self, user_id: int, token: str) -> None:
         with MailingStore(self.settings.database_path) as store:
             store.set_awaiting_email(user_id, False)
-        self.pending_unsubscribes[user_id] = (token, time.monotonic())
-        self.pending_unsubscribes.move_to_end(user_id)
-        while len(self.pending_unsubscribes) > MAX_CHATS:
-            self.pending_unsubscribes.popitem(last=False)
+            store.clear_pending_language(user_id)
+            store.set_pending_unsubscribe(user_id, token, time.time())
         await self._reply(
             user_id,
             "이 메일링의 이메일 수신을 중단하려면 /unsubscribe를 입력해 주세요.\n취소: /cancel",
         )
 
     async def _cancel(self, user_id: int) -> None:
-        self.pending_unsubscribes.pop(user_id, None)
         with MailingStore(self.settings.database_path) as store:
+            store.pop_pending_unsubscribe(user_id)
+            store.clear_pending_language(user_id)
             store.set_awaiting_email(user_id, False)
         await self._reply(user_id, "입력을 취소했습니다. 다시 가입하려면 /subscribe를 입력하세요.")
 
@@ -378,11 +511,14 @@ class CommandHandler:
             if chat.get("type") != "private":
                 if chat.get("type") not in {"group", "supergroup"}:
                     return
-                if command in {"subscribe", "unsubscribe"} or (command == "start" and argument == "subscribe"):
+                private_management_start = command == "start" and argument.startswith(("language_", "unsubscribe_"))
+                if command in {"subscribe", "unsubscribe", "language"} or private_management_start or (
+                    command == "start" and argument == "subscribe"
+                ):
                     # Never parse, retain or repeat an email posted in a group.
                     link = (
                         self.subscribe_url.removesuffix("?start=subscribe")
-                        if command == "unsubscribe" else self.subscribe_url
+                        if command in {"unsubscribe", "language"} or private_management_start else self.subscribe_url
                     )
                     reply = "이메일 주소는 봇과의 개인 대화에서 입력해 주세요."
                     if link:
@@ -390,6 +526,8 @@ class CommandHandler:
                     await self._reply(chat_id, reply)
                 elif command == "invite":
                     await self._invite(chat_id)
+                elif command == "share":
+                    await self._share(chat_id)
                 return
             if command == "subscribe" or (command == "start" and argument == "subscribe"):
                 if verified_private:
@@ -400,6 +538,15 @@ class CommandHandler:
                     await self._start_unsubscribe(user_id, token)
                 else:
                     await self._reply(chat_id, "수신 거부 링크를 확인해 주세요.")
+            elif command == "start" and argument.startswith("language_"):
+                token = argument.removeprefix("language_")
+                if verified_private and re.fullmatch(r"[A-Za-z0-9_-]{20,52}", token):
+                    await self._start_language(user_id, token)
+                else:
+                    await self._reply(chat_id, "언어 설정 링크를 확인해 주세요. / Check the language link in your email.")
+            elif command == "language":
+                if verified_private:
+                    await self._language(user_id, argument)
             elif command == "unsubscribe":
                 if verified_private:
                     await self._unsubscribe(user_id)
@@ -407,9 +554,11 @@ class CommandHandler:
                 if verified_private:
                     await self._cancel(user_id)
             elif command in {"start", "help"}:
-                await self._reply(chat_id, self._welcome())
+                await self._reply(chat_id, self._welcome(), post=True)
             elif command == "invite":
                 await self._invite(chat_id)
+            elif command == "share":
+                await self._share(chat_id)
             elif command == "sources":
                 await self._reply(chat_id, self._sources())
             elif command == "tools":
