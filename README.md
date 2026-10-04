@@ -243,6 +243,31 @@ python -m compdesign_bot mail-edit new@example.com --language en
 python -m compdesign_bot mail-remove new@example.com
 ```
 
+Gmail을 쓰는 경우 반송 확인을 켜세요. SMTP와 같은 계정·앱 비밀번호로 Gmail IMAP에 연결합니다.
+
+```dotenv
+MAILING_BOUNCE_ENABLED=true
+IMAP_HOST=imap.gmail.com
+IMAP_PORT=993
+```
+
+메일 발송 전에 전체 보관함과 스팸함의 반송 통지를 확인합니다. 조회 실패나 확인할 메일이 남아 있으면
+메일 발송을 보류하며 텔레그램 발행은 계속됩니다. 조회는 읽기 전용이며 수신함의 읽음 상태나 메일을 바꾸지 않습니다.
+Gmail 인증 결과, 반환된 원본 메시지 ID와 수신 주소를 실제 발송 기록에 대조한 반송만 적용합니다.
+없는 사서함·무효 도메인 등 확실한 주소 오류는 활성 목록에서 제외하고, 접근·정책 거절과 메일함 용량 초과는
+주소별 발송을 보류합니다. 일시적인 `delayed/4.x` 반송의 보류는 48시간 뒤 해제하며 이후 새 브리핑부터 받습니다.
+그 외 보류는 원인을 확인한 뒤 운영자가 해제합니다. 발송 완료 기록과 발송량 집계는 보존하므로
+반송된 원본 메일을 자동으로 재발송하지 않습니다. 엑셀 재가져오기로 차단·보류 상태가 해제되지 않습니다.
+
+```bash
+python -m compdesign_bot mail-sync-bounces  # 반송 확인·처리만 실행, 메일 발송 없음
+python -m compdesign_bot mail-status        # bounces에 제외·보류·발송 가능 인원 표시
+python -m compdesign_bot mail-resume person@example.com  # 원인 해결 후 보류 해제
+```
+
+`mail-resume`는 보류된 활성 주소에만 적용되며, 이미 취소된 대기 메일을 다시 보내지 않습니다.
+주소가 잘못됐다면 확인된 새 주소로 `mail-edit`하거나, 기존 구독을 관리하는 본인이 `/subscribe`로 새 주소를 등록하세요.
+
 `publish` 및 예약 발행은 게시 성공한 글을 메일 대기열에도 기록합니다.
 미리보기와 `/latest` 요청은 메일을 발송하지 않습니다. 가입 시점 이전의 모든 과거 글을 소급 발송하지 않습니다.
 전송 성공 여부가 불명확하거나 실패한 메일은 자동 반복 발송하지 않습니다.

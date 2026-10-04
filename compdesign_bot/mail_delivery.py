@@ -5,6 +5,7 @@ import logging
 import sqlite3
 
 from .config import Settings
+from .mail_bounce_sync import BounceSyncUnavailable, sync_mail_bounces
 from .mailing import MailingStore, deliver_pending
 from .storage import Store, job_lock
 
@@ -42,6 +43,12 @@ def send_mail_queue(settings: Settings):
     with job_lock(settings.database_path.with_suffix(".mail.sqlite3")):
         mail = MailingStore(settings.database_path)
         try:
+            if settings.mailing_bounce_enabled:
+                bounces = sync_mail_bounces(settings, mail)
+                if bounces.backlog or bounces.untrusted:
+                    raise BounceSyncUnavailable("반송 확인이 남아 있어 메일 발송을 보류합니다. mail-sync-bounces로 확인하세요.")
+            else:
+                mail.release_expired_bounce_holds()
             return deliver_pending(settings, mail, bot_username=settings.bot_username)
         finally:
             mail.close()

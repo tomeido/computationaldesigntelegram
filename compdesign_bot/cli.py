@@ -219,9 +219,23 @@ async def discover_channel(settings: Settings):
 
 async def dispatch(args, settings: Settings):
     if args.command in {"mail-import", "mail-status", "mail-send", "resolve-mail-delivery", "mail-prospects-import",
-                        "mail-edit", "mail-remove"}:
+                        "mail-edit", "mail-remove", "mail-sync-bounces", "mail-resume"}:
         from .mail_delivery import send_mail_queue, sync_mail_queue
         from .mailing import MailingStore
+
+        if args.command == "mail-sync-bounces":
+            from .mail_bounce_sync import sync_mail_bounces
+
+            def synchronize_bounces():
+                with (
+                    job_lock(settings.database_path.with_suffix(".mail.sqlite3")),
+                    MailingStore(settings.database_path) as mail,
+                ):
+                    return sync_mail_bounces(settings, mail)
+
+            report = await asyncio.to_thread(synchronize_bounces)
+            print(json.dumps(asdict(report), ensure_ascii=False, indent=2))
+            return
 
         if args.command == "mail-send":
             report = await asyncio.to_thread(send_mail_queue, settings)
@@ -251,6 +265,7 @@ async def dispatch(args, settings: Settings):
                         "subscribers": mail.status_counts(), "outbox": mail.outbox_counts(),
                         "delivery": mail.delivery_status(settings),
                         "languages": mail.language_counts(), "prospects": mail.prospect_counts(),
+                        "bounces": mail.bounce_status(),
                         "unresolved": mail.unresolved(),
                     }, ensure_ascii=False, indent=2))
                 elif args.command == "mail-edit":
@@ -258,6 +273,8 @@ async def dispatch(args, settings: Settings):
                     print(json.dumps({"updated": changed}))
                 elif args.command == "mail-remove":
                     print(json.dumps({"removed_from_active_list": mail.remove_subscriber(args.email)}))
+                elif args.command == "mail-resume":
+                    print(json.dumps({"resumed_future_delivery": mail.resume_bounce_hold(args.email)}))
                 else:
                     mail.resolve(args.id, retry=args.retry)
                     print(
@@ -364,6 +381,9 @@ def main():
     p.add_argument("json_path", type=Path)
     sub.add_parser("mail-status", help="메일 구독자 수와 발송 대기·실패 기록 확인")
     sub.add_parser("mail-send", help="대기 중인 브리핑 메일 발송 (텔레그램 재발행 없음)")
+    sub.add_parser("mail-sync-bounces", help="Gmail 반송 확인 및 무효 주소 제외·발송 보류 (메일 발송 없음)")
+    p = sub.add_parser("mail-resume", help="원인 해결 후 주소별 반송 보류 해제 (기존 메일 재발송 없음)")
+    p.add_argument("email", help="발송을 재개할 보류 주소")
     p = sub.add_parser("mail-edit", help="활성 구독자의 이메일·수신 언어 수정")
     p.add_argument("email", help="현재 이메일 주소")
     p.add_argument("--email", dest="new_email", help="변경할 이메일 주소")

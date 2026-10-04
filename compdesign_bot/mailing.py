@@ -230,6 +230,20 @@ class MailingStore:
                 error TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL,
                 UNIQUE(post_key, email)
             );
+            CREATE TABLE IF NOT EXISTS mailing_delivery_blocks (
+                email TEXT PRIMARY KEY, state TEXT NOT NULL, reason TEXT NOT NULL,
+                status TEXT NOT NULL, hold_until TEXT, created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS mailing_bounce_events (
+                id INTEGER PRIMARY KEY, message_id TEXT NOT NULL, email TEXT NOT NULL,
+                action TEXT NOT NULL, status TEXT NOT NULL, reason TEXT NOT NULL,
+                applied INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL,
+                UNIQUE(message_id,email,action,status)
+            );
+            CREATE TABLE IF NOT EXISTS mailing_bounce_cursors (
+                mailbox_key TEXT PRIMARY KEY, uidvalidity TEXT NOT NULL,
+                last_uid INTEGER NOT NULL, updated_at TEXT NOT NULL
+            );
         """)
         with self.db:
             self.db.execute("BEGIN IMMEDIATE")
@@ -285,6 +299,7 @@ class MailingStore:
                     "UPDATE mailing_subscribers SET active=1, telegram_user_id=?, created_at=? WHERE email=?",
                     (telegram_user_id, datetime.now(UTC).isoformat(), email),
                 )
+                self.db.execute("DELETE FROM mailing_delivery_blocks WHERE email=?", (email,))
             else:
                 self.db.execute(
                     "INSERT INTO mailing_subscribers(email,token,telegram_user_id,created_at,language) VALUES(?,?,?,?,?)",
@@ -538,6 +553,127 @@ class MailingStore:
     def outbox_counts(self) -> dict[str, int]:
         return dict(self.db.execute("SELECT status,COUNT(*) FROM mailing_outbox GROUP BY status"))
 
+    def bounce_matches(self, notice) -> bool:
+        return bool(self.db.execute(
+            "SELECT 1 FROM mailing_outbox WHERE batch_message_id=? AND email=? "
+            "AND status IN ('sent','pending','uncertain') LIMIT 1",
+            (notice.message_id, normalize_email(notice.recipient)),
+        ).fetchone())
+
+    def apply_bounce(self, notice) -> str:
+        """Apply an authenticated DSN only to the exact original recipient/membership."""
+        email = normalize_email(notice.recipient)
+        now = datetime.now(UTC).isoformat()
+        with self.db:
+            self.db.execute("BEGIN IMMEDIATE")
+            sent = self.db.execute(
+                "SELECT MIN(COALESCE(attempted_at,sent_at,created_at)) AS attempted_at "
+                "FROM mailing_outbox WHERE batch_message_id=? AND email=? "
+                "AND status IN ('sent','pending','uncertain')",
+                (notice.message_id, email),
+            ).fetchone()
+            if not sent["attempted_at"]:
+                return "unmatched"
+            subscriber = self.db.execute(
+                "SELECT active,created_at FROM mailing_subscribers WHERE email=?", (email,),
+            ).fetchone()
+            if subscriber is None:
+                return "unmatched"
+            stale = datetime.fromisoformat(subscriber["created_at"]) > datetime.fromisoformat(sent["attempted_at"])
+            added = self.db.execute(
+                "INSERT OR IGNORE INTO mailing_bounce_events"
+                "(message_id,email,action,status,reason,applied,created_at) VALUES(?,?,?,?,?,?,?)",
+                (notice.message_id, email, notice.action, notice.status, notice.reason, 0, now),
+            ).rowcount
+            if not added:
+                return "duplicate"
+            if stale or not subscriber["active"]:
+                return "stale"
+            previous = self.db.execute(
+                "SELECT * FROM mailing_delivery_blocks WHERE email=?", (email,),
+            ).fetchone()
+            hold_until = (datetime.now(UTC) + timedelta(hours=48)).isoformat() if notice.action == "delayed" else None
+            if previous and previous["state"] == "held" and previous["hold_until"] is None:
+                hold_until = None
+            self.db.execute(
+                "INSERT INTO mailing_delivery_blocks VALUES(?,?,?,?,?,?) "
+                "ON CONFLICT(email) DO UPDATE SET state=excluded.state,reason=excluded.reason,"
+                "status=excluded.status,hold_until=excluded.hold_until,created_at=excluded.created_at",
+                (email, "bounced" if notice.permanent else "held", notice.reason, notice.status, hold_until, now),
+            )
+            if notice.permanent:
+                self.db.execute("UPDATE mailing_subscribers SET active=0 WHERE email=?", (email,))
+            self.db.execute(
+                "UPDATE mailing_outbox SET status='suppressed',error='recipient_bounced' "
+                "WHERE email=? AND status IN ('queued','failed')", (email,),
+            )
+            self.db.execute(
+                "UPDATE mailing_bounce_events SET applied=1 WHERE message_id=? AND email=? AND action=? AND status=?",
+                (notice.message_id, email, notice.action, notice.status),
+            )
+        return "applied"
+
+    def bounce_status(self) -> dict:
+        return {
+            "eligible_subscribers": self.db.execute(
+                "SELECT COUNT(*) FROM mailing_subscribers s WHERE active=1 AND NOT EXISTS "
+                "(SELECT 1 FROM mailing_delivery_blocks b WHERE b.email=s.email)"
+            ).fetchone()[0],
+            "held_subscribers": self.db.execute(
+                "SELECT COUNT(*) FROM mailing_delivery_blocks b JOIN mailing_subscribers s ON s.email=b.email "
+                "WHERE b.state='held' AND s.active=1"
+            ).fetchone()[0],
+            "bounced_subscribers": self.db.execute(
+                "SELECT COUNT(*) FROM mailing_delivery_blocks WHERE state='bounced'"
+            ).fetchone()[0],
+            "event_count": self.db.execute("SELECT COUNT(*) FROM mailing_bounce_events").fetchone()[0],
+            "reasons": dict(self.db.execute(
+                "SELECT reason,COUNT(*) FROM mailing_delivery_blocks GROUP BY reason"
+            )),
+        }
+
+    def release_expired_bounce_holds(self) -> int:
+        with self.db:
+            return self.db.execute(
+                "DELETE FROM mailing_delivery_blocks WHERE state='held' AND hold_until IS NOT NULL AND hold_until<=?",
+                (datetime.now(UTC).isoformat(),),
+            ).rowcount
+
+    def resume_bounce_hold(self, email: str) -> bool:
+        email = normalize_email(email)
+        with self.db:
+            return bool(self.db.execute(
+                "DELETE FROM mailing_delivery_blocks WHERE email=? AND state='held' "
+                "AND EXISTS (SELECT 1 FROM mailing_subscribers s WHERE s.email=? AND s.active=1)",
+                (email, email),
+            ).rowcount)
+
+    def bounce_cursor(self, mailbox_key: str) -> tuple[str, int] | None:
+        row = self.db.execute(
+            "SELECT uidvalidity,last_uid FROM mailing_bounce_cursors WHERE mailbox_key=?", (mailbox_key,),
+        ).fetchone()
+        return (row[0], row[1]) if row else None
+
+    def save_bounce_cursor(self, mailbox_key: str, uidvalidity: str, last_uid: int) -> None:
+        with self.db:
+            self.db.execute(
+                "INSERT INTO mailing_bounce_cursors VALUES(?,?,?,?) ON CONFLICT(mailbox_key) DO UPDATE "
+                "SET uidvalidity=excluded.uidvalidity,last_uid=CASE "
+                "WHEN mailing_bounce_cursors.uidvalidity=excluded.uidvalidity "
+                "THEN MAX(mailing_bounce_cursors.last_uid,excluded.last_uid) ELSE excluded.last_uid END,"
+                "updated_at=excluded.updated_at",
+                (mailbox_key, uidvalidity, last_uid, datetime.now(UTC).isoformat()),
+            )
+
+    def bounce_scan_since(self) -> str:
+        earliest = self.db.execute(
+            "SELECT MIN(COALESCE(attempted_at,sent_at,created_at)) FROM mailing_outbox "
+            "WHERE batch_message_id IS NOT NULL"
+        ).fetchone()[0]
+        start = datetime.fromisoformat(earliest) - timedelta(days=1) if earliest else datetime.now(UTC) - timedelta(days=30)
+        months = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+        return f"{start.day:02}-{months[start.month - 1]}-{start.year}"
+
     def _recent_message_count(self, statuses: tuple[str, ...]) -> int:
         cutoff = (datetime.now(UTC) - timedelta(hours=24)).isoformat()
         placeholders = ",".join("?" for _ in statuses)
@@ -552,7 +688,8 @@ class MailingStore:
         reserved = self._recent_message_count(("pending", "uncertain"))
         pending = self.db.execute(
             "SELECT COUNT(DISTINCT o.email) FROM mailing_outbox o "
-            "JOIN mailing_subscribers s ON s.email=o.email WHERE o.status='queued' AND s.active=1"
+            "JOIN mailing_subscribers s ON s.email=o.email WHERE o.status='queued' AND s.active=1 "
+            "AND NOT EXISTS (SELECT 1 FROM mailing_delivery_blocks b WHERE b.email=s.email)"
         ).fetchone()[0]
         latest = self.db.execute(
             "SELECT MAX(COALESCE(sent_at,attempted_at,created_at)) FROM mailing_outbox WHERE status='sent'"
@@ -560,7 +697,8 @@ class MailingStore:
         paused = self.db.execute(
             "SELECT COUNT(DISTINCT o.email) FROM mailing_outbox o "
             "JOIN mailing_subscribers s ON s.email=o.email "
-            "WHERE o.status='queued' AND o.error='smtp_paused' AND s.active=1"
+            "WHERE o.status='queued' AND o.error='smtp_paused' AND s.active=1 "
+            "AND NOT EXISTS (SELECT 1 FROM mailing_delivery_blocks b WHERE b.email=s.email)"
         ).fetchone()[0]
         return {
             "pending_recipients": pending,
@@ -583,7 +721,8 @@ class MailingStore:
             if added:
                 self.db.execute(
                     "INSERT INTO mailing_outbox(post_key,email,created_at) "
-                    "SELECT ?,email,? FROM mailing_subscribers WHERE active=1 AND created_at<=?",
+                    "SELECT ?,email,? FROM mailing_subscribers s WHERE active=1 AND created_at<=? "
+                    "AND NOT EXISTS (SELECT 1 FROM mailing_delivery_blocks b WHERE b.email=s.email)",
                     (str(post_key), datetime.now(UTC).isoformat(), published_at),
                 )
 
@@ -605,10 +744,14 @@ class MailingStore:
                 raise ValueError("해당 ID의 미확인 이메일 전송 기록이 없습니다.")
             condition = "batch_message_id=?" if row["batch_message_id"] else "id=?"
             updated = self.db.execute(
-                "UPDATE mailing_outbox SET status=?,error='', "
+                "UPDATE mailing_outbox SET status=CASE WHEN ?='queued' AND (NOT EXISTS ("
+                "SELECT 1 FROM mailing_subscribers s WHERE s.email=mailing_outbox.email AND s.active=1) "
+                "OR EXISTS (SELECT 1 FROM mailing_delivery_blocks b WHERE b.email=mailing_outbox.email)) "
+                "THEN 'suppressed' ELSE ? END,error='', "
                 "sent_at=CASE WHEN ? THEN NULL ELSE COALESCE(sent_at,attempted_at,created_at) END "
                 f"WHERE {condition} AND status IN ('pending','uncertain','failed')",
-                ("queued" if retry else "sent", retry, row["batch_message_id"] or delivery_id),
+                ("queued" if retry else "sent", "queued" if retry else "sent", retry,
+                 row["batch_message_id"] or delivery_id),
             ).rowcount
             if not updated:
                 raise ValueError("해당 ID의 미확인 이메일 전송 기록이 없습니다.")
@@ -618,7 +761,8 @@ class MailingStore:
             return bool(self.db.execute(
                 "UPDATE mailing_outbox SET status='pending',attempts=attempts+1,error='',attempted_at=? "
                 "WHERE id=? AND status='queued' "
-                "AND EXISTS (SELECT 1 FROM mailing_subscribers s WHERE s.email=mailing_outbox.email AND s.active=1)",
+                "AND EXISTS (SELECT 1 FROM mailing_subscribers s WHERE s.email=mailing_outbox.email AND s.active=1) "
+                "AND NOT EXISTS (SELECT 1 FROM mailing_delivery_blocks b WHERE b.email=mailing_outbox.email)",
                 (datetime.now(UTC).isoformat(), delivery_id),
             ).rowcount)
 
@@ -634,7 +778,8 @@ class MailingStore:
             eligible = self.db.execute(
                 f"SELECT COUNT(*),COUNT(DISTINCT o.email) FROM mailing_outbox o "
                 f"WHERE o.id IN ({placeholders}) AND o.status='queued' "
-                "AND EXISTS (SELECT 1 FROM mailing_subscribers s WHERE s.email=o.email AND s.active=1)", ids,
+                "AND EXISTS (SELECT 1 FROM mailing_subscribers s WHERE s.email=o.email AND s.active=1) "
+                "AND NOT EXISTS (SELECT 1 FROM mailing_delivery_blocks b WHERE b.email=o.email)", ids,
             ).fetchone()
             if eligible[0] != len(ids) or eligible[1] != 1:
                 return False
@@ -658,7 +803,8 @@ class MailingStore:
             self.db.execute(
                 "UPDATE mailing_outbox SET status=CASE WHEN ?='queued' AND NOT EXISTS ("
                 "SELECT 1 FROM mailing_subscribers s JOIN mailing_posts p ON p.post_key=mailing_outbox.post_key "
-                "WHERE s.email=mailing_outbox.email AND s.active=1 AND s.created_at<=p.created_at"
+                "WHERE s.email=mailing_outbox.email AND s.active=1 AND s.created_at<=p.created_at "
+                "AND NOT EXISTS (SELECT 1 FROM mailing_delivery_blocks b WHERE b.email=s.email)"
                 ") THEN 'suppressed' ELSE ? END, "
                 f"error=?,sent_at=? WHERE id IN ({placeholders})",
                 (status, status, error, datetime.now(UTC).isoformat() if status == "sent" else None, *delivery_ids),
@@ -763,6 +909,22 @@ class EmailContentError(EmailDeliveryError):
     """The SMTP server rejected DATA permanently; stop before repeating the content."""
 
 
+class EmailRecipientRejected(EmailDeliveryError):
+    """A definite recipient-level SMTP rejection, with a sanitized structured reason."""
+
+    def __init__(self, message: EmailMessage, response: bytes):
+        from .mail_bounces import BounceNotice, classify_bounce
+
+        match = re.search(rb"\b5\.\d{1,3}\.\d{1,3}\b", response)
+        status = match[0].decode("ascii") if match else "5.0.0"
+        reason, permanent = classify_bounce("failed", status) or ("recipient_rejected", False)
+        self.notice = BounceNotice(
+            str(message["Message-ID"] or ""), normalize_email(str(message["To"])),
+            "failed", status, reason, permanent,
+        )
+        super().__init__("SMTP 서버가 수신 주소를 거절했습니다.")
+
+
 class SMTPMailer:
     def __init__(self, settings):
         self.settings = settings
@@ -789,11 +951,17 @@ class SMTPMailer:
                 message, from_addr=normalize_email(str(message["From"])), to_addrs=[str(message["To"])],
             )
             if refused:
-                raise EmailDeliveryError("SMTP 서버가 수신자를 거절했습니다.")
+                raise smtplib.SMTPRecipientsRefused(refused)
         except smtplib.SMTPRecipientsRefused as error:
-            if any(400 <= response[0] < 500 for response in error.recipients.values()):
+            if any(
+                400 <= response[0] < 500 or any(marker in response[1].lower() for marker in (
+                    b"5.4.5", b"daily user sending", b"sending limit", b"rate limit", b"daily limit",
+                ))
+                for response in error.recipients.values()
+            ):
                 raise EmailDeliveryPaused("SMTP 서버가 발송을 일시적으로 제한했습니다.") from None
-            raise EmailDeliveryError("SMTP 서버가 이메일을 거절했습니다.") from None
+            response = next(iter(error.recipients.values()))[1] if len(error.recipients) == 1 else b""
+            raise EmailRecipientRejected(message, response) from None
         except smtplib.SMTPDataError as error:
             response = error.smtp_error.lower()
             if 400 <= error.smtp_code < 500 or any(
@@ -864,7 +1032,9 @@ def _deliver_pending(settings, store: MailingStore, *, bot_username: str, sender
     for rows in _digest_groups(pending):
         row = rows[0]
         delivery_ids = [item["id"] for item in rows]
-        if not row["active"]:
+        if not row["active"] or store.db.execute(
+            "SELECT 1 FROM mailing_delivery_blocks WHERE email=?", (row["email"],),
+        ).fetchone():
             store.finish_batch(delivery_ids, "suppressed")
             report.skipped += 1
             continue
@@ -926,6 +1096,10 @@ def _deliver_pending(settings, store: MailingStore, *, bot_username: str, sender
             store.finish_batch(delivery_ids, "failed", "smtp_connection")
             report.failed += 1
             break
+        except EmailRecipientRejected as error:
+            store.apply_bounce(error.notice)
+            store.finish_batch(delivery_ids, "failed", "smtp_recipient_rejected")
+            report.failed += 1
         except EmailDeliveryError:
             store.finish_batch(delivery_ids, "failed", "smtp_rejected")
             report.failed += 1

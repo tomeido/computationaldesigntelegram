@@ -51,6 +51,9 @@ class Settings:
     mailing_xlsx_path: Path | None = None
     mailing_batch_limit: int = 200
     mailing_daily_limit: int = 400
+    mailing_bounce_enabled: bool = False
+    imap_host: str = ""
+    imap_port: int = 993
     smtp_host: str = ""
     smtp_port: int = 587
     smtp_username: str = field(default="", repr=False)
@@ -69,6 +72,8 @@ class Settings:
             raise ValueError("SMTP_SECURITY: starttls 또는 ssl을 입력하세요.")
         if not 1 <= self.smtp_port <= 65535:
             raise ValueError("SMTP_PORT: 1~65535 범위로 입력하세요.")
+        if not 1 <= self.imap_port <= 65535:
+            raise ValueError("IMAP_PORT: 1~65535 범위로 입력하세요.")
         if self.bot_username and not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{4,31}", self.bot_username):
             raise ValueError("TELEGRAM_BOT_USERNAME: @를 제외한 봇 사용자명을 입력하세요.")
         if self.telegram_invite_url:
@@ -135,6 +140,9 @@ class Settings:
             ),
             mailing_batch_limit=_integer("MAILING_BATCH_LIMIT", 200, 1, 1000),
             mailing_daily_limit=_integer("MAILING_DAILY_LIMIT", 400, 1, 10000),
+            mailing_bounce_enabled=_boolean("MAILING_BOUNCE_ENABLED"),
+            imap_host=os.getenv("IMAP_HOST", "").strip().lower(),
+            imap_port=_integer("IMAP_PORT", 993, 1, 65535),
             smtp_host=os.getenv("SMTP_HOST", "").strip(),
             smtp_port=_integer("SMTP_PORT", 587, 1, 65535),
             smtp_username=os.getenv("SMTP_USERNAME", "").strip(),
@@ -160,6 +168,12 @@ class Settings:
         from .local_summary import check_model
 
         check_model(self.local_model_path)
+
+    def require_bounces(self) -> None:
+        if not self.mailing_bounce_enabled:
+            raise ValueError("반송 확인에는 MAILING_BOUNCE_ENABLED=true 설정이 필요합니다.")
+        if self.imap_host != "imap.gmail.com" or not self.smtp_username or not self.smtp_password:
+            raise ValueError("자동 반송 확인에는 Gmail IMAP 주소와 SMTP 계정 인증정보가 필요합니다.")
 
     def require_token(self) -> None:
         if not self.bot_token:
