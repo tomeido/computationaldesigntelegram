@@ -1,0 +1,8 @@
+# Existing HTTPS proxy forwards /unsubscribe/ to this loopback-only host port.
+# Use alongside compose.yaml, not as a standalone compose file.
+services:
+  bot:
+    environment:
+      MAILING_UNSUBSCRIBE_HOST: 0.0.0.0
+    ports:
+      - "127.0.0.1:${MAILING_UNSUBSCRIBE_PORT:-8085}:${MAILING_UNSUBSCRIBE_PORT:-8085}"

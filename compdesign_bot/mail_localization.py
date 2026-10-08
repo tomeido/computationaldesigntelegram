@@ -200,15 +200,32 @@ def normalize_language(value: str) -> str:
     return code
 
 
-def language_copy(code: str) -> dict[str, str]:
+_ONE_CLICK_HINTS = {
+    "ko": "버튼이나 링크를 한 번 누르면 메일 수신이 해지됩니다.",
+    "en": "Click the button or link once to stop receiving these emails.",
+    "ja": "ボタンまたはリンクを1回押すとメールの配信が停止されます。",
+    "zh": "点击一次按钮或链接即可停止接收这些邮件。",
+    "de": "Klicken Sie einmal auf die Schaltfläche oder den Link, um die E-Mails abzubestellen.",
+    "fr": "Cliquez une fois sur le bouton ou le lien pour ne plus recevoir ces e-mails.",
+    "es": "Haz clic una vez en el botón o enlace para dejar de recibir estos correos.",
+    "pt": "Clique uma vez no botão ou link para deixar de receber estes e-mails.",
+}
+
+
+def language_copy(code: str, *, one_click_unsubscribe: bool = False) -> dict[str, str]:
     code = normalize_language(code)
     if code == "bilingual":
         values = {
             key: f"{ko} / {en}" for key, ko, en in zip(_COPY_KEYS, _COPY["ko"], _COPY["en"], strict=True)
         }
         values["html_lang"] = "ko"
+        if one_click_unsubscribe:
+            values["unsubscribe_hint"] = f"{_ONE_CLICK_HINTS['ko']} / {_ONE_CLICK_HINTS['en']}"
         return values
-    return {"html_lang": code, **dict(zip(_COPY_KEYS, _COPY[code], strict=True))}
+    values = {"html_lang": code, **dict(zip(_COPY_KEYS, _COPY[code], strict=True))}
+    if one_click_unsubscribe:
+        values["unsubscribe_hint"] = _ONE_CLICK_HINTS[code]
+    return values
 
 
 class _HTMLSlots(HTMLParser):

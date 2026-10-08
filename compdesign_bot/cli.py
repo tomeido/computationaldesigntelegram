@@ -219,7 +219,7 @@ async def discover_channel(settings: Settings):
 
 async def dispatch(args, settings: Settings):
     if args.command in {"mail-import", "mail-status", "mail-send", "resolve-mail-delivery", "mail-prospects-import",
-                        "mail-edit", "mail-remove", "mail-sync-bounces", "mail-resume"}:
+                        "mail-edit", "mail-remove", "mail-sync-bounces", "mail-resume", "mail-apply-exclusions"}:
         from .mail_delivery import send_mail_queue, sync_mail_queue
         from .mailing import MailingStore
 
@@ -250,6 +250,7 @@ async def dispatch(args, settings: Settings):
         with job_lock(settings.database_path.with_suffix(".mail.sqlite3")):
             mail = MailingStore(settings.database_path)
             try:
+                removed = mail.apply_exclusions(settings.mailing_exclusions_path)
                 if args.command == "mail-import":
                     path = args.xlsx or settings.mailing_xlsx_path
                     if not path:
@@ -273,6 +274,8 @@ async def dispatch(args, settings: Settings):
                     print(json.dumps({"updated": changed}))
                 elif args.command == "mail-remove":
                     print(json.dumps({"removed_from_active_list": mail.remove_subscriber(args.email)}))
+                elif args.command == "mail-apply-exclusions":
+                    print(json.dumps({"removed_from_active_list": removed}))
                 elif args.command == "mail-resume":
                     print(json.dumps({"resumed_future_delivery": mail.resume_bounce_hold(args.email)}))
                 else:
@@ -306,17 +309,19 @@ async def dispatch(args, settings: Settings):
         print(f"채널 이름·소개 설정 완료: {settings.channel_name}")
     elif args.command in ("run", "listen"):
         from .bot_runtime import listen
+        from .mail_unsubscribe import unsubscribe_server
 
         settings.require_token()
-        if settings.mailing_xlsx_path:
+        if settings.mailing_xlsx_path or settings.mailing_exclusions_path.exists():
             from .mail_delivery import sync_mail_queue
 
             await asyncio.to_thread(sync_mail_queue, settings)
-        if args.command == "run" and settings.channel_id:
-            await asyncio.gather(listen(settings), serve(settings))
-        else:
-            print("봇 개인 대화 응답을 시작합니다. 채널 발행은 채널 연결 후 활성화됩니다.", flush=True)
-            await listen(settings)
+        with unsubscribe_server(settings):
+            if args.command == "run" and settings.channel_id:
+                await asyncio.gather(listen(settings), serve(settings))
+            else:
+                print("봇 개인 대화 응답을 시작합니다. 채널 발행은 채널 연결 후 활성화됩니다.", flush=True)
+                await listen(settings)
     elif args.command in ("preview", "publish"):
         result = await run_digest(settings, publish=args.command == "publish")
         if args.command == "preview":
@@ -390,6 +395,7 @@ def main():
     p.add_argument("--language", help="수신 언어 (ko, en, ja, zh, de, fr, es, pt, bilingual)")
     p = sub.add_parser("mail-remove", help="활성 목록에서 제외하고 대기 메일 취소 (재등록 방지 기록 유지)")
     p.add_argument("email", help="제외할 이메일 주소")
+    sub.add_parser("mail-apply-exclusions", help="비공개 수신 거부 목록 적용 (메일 발송 없음)")
     p = sub.add_parser("resolve-mail-delivery", help="SMTP 확인 후 동일 메일에 묶인 미확인·실패 기록 함께 처리")
     p.add_argument("id", type=int, help="mail-status의 기록 ID; 동일 메일에 묶인 기록을 함께 처리")
     group = p.add_mutually_exclusive_group(required=True)

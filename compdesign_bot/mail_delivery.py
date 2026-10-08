@@ -19,6 +19,7 @@ def sync_mail_queue(settings: Settings) -> dict:
         posts = Store(settings.database_path)
         try:
             imported = None
+            removed = mail.apply_exclusions(settings.mailing_exclusions_path)
             if settings.mailing_xlsx_path:
                 imported = mail.import_xlsx(settings.mailing_xlsx_path)
             for row in posts.db.execute(
@@ -29,7 +30,8 @@ def sync_mail_queue(settings: Settings) -> dict:
                 mail.store_post(
                     f"telegram:{row['id']}", row["title"], row["post_html"], published_at=row["created_at"],
                 )
-            return {"subscribers": mail.status_counts(), "outbox": mail.outbox_counts(), "imported": imported}
+            return {"subscribers": mail.status_counts(), "outbox": mail.outbox_counts(),
+                    "imported": imported, "removed": removed}
         finally:
             posts.close()
             mail.close()

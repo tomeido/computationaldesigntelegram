@@ -1,6 +1,7 @@
 """Private mailing-list membership, XLSX imports, and durable SMTP delivery."""
 
 import hashlib
+import json
 import posixpath
 import re
 import secrets
@@ -250,6 +251,8 @@ class MailingStore:
             subscriber_columns = {row["name"] for row in self.db.execute("PRAGMA table_info(mailing_subscribers)")}
             if "language" not in subscriber_columns:
                 self.db.execute("ALTER TABLE mailing_subscribers ADD COLUMN language TEXT NOT NULL DEFAULT 'ko'")
+            if "operator_excluded" not in subscriber_columns:
+                self.db.execute("ALTER TABLE mailing_subscribers ADD COLUMN operator_excluded INTEGER NOT NULL DEFAULT 0")
             columns = {row["name"] for row in self.db.execute("PRAGMA table_info(mailing_outbox)")}
             for name in ("attempted_at", "sent_at", "batch_message_id"):
                 if name not in columns:
@@ -276,6 +279,8 @@ class MailingStore:
         with self.db:
             self.db.execute("BEGIN IMMEDIATE")
             current = self.db.execute("SELECT * FROM mailing_subscribers WHERE email=?", (email,)).fetchone()
+            if current and current["operator_excluded"]:
+                return "email_in_use"
             if current and current["telegram_user_id"] not in (None, telegram_user_id):
                 return "email_in_use"
             if current and not current["active"] and current["telegram_user_id"] is None:
@@ -325,6 +330,7 @@ class MailingStore:
 
     def unsubscribe_token(self, token: str) -> bool:
         with self.db:
+            self.db.execute("BEGIN IMMEDIATE")
             self.db.execute(
                 "UPDATE mailing_outbox SET status='suppressed' WHERE status IN ('queued','failed') "
                 "AND email IN (SELECT email FROM mailing_subscribers WHERE token=?)", (token,),
@@ -514,6 +520,43 @@ class MailingStore:
             )
             self.db.execute("UPDATE mailing_subscribers SET active=0 WHERE email=?", (email,))
         return True
+
+    def apply_exclusions(self, path: Path) -> int:
+        """Apply private operator stop requests before imports and every send.
+
+        Tombstones also cover addresses absent from this DB so later XLSX imports
+        cannot accidentally enroll someone who already asked to stop.
+        """
+        path = Path(path)
+        try:
+            size = path.stat().st_size
+        except FileNotFoundError:
+            return 0
+        if size > 65536:
+            raise ValueError("메일 제외 목록은 64KB 이하여야 합니다.")
+        try:
+            addresses = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(addresses, list) or any(not isinstance(email, str) for email in addresses):
+                raise ValueError
+            emails = set(normalize_email(email) for email in addresses)
+        except (ValueError, UnicodeError):
+            raise ValueError("메일 제외 목록은 유효한 이메일 주소의 JSON 배열이어야 합니다.") from None
+        removed = 0
+        with self.db:
+            self.db.execute("BEGIN IMMEDIATE")
+            for email in sorted(emails):
+                row = self.db.execute("SELECT active FROM mailing_subscribers WHERE email=?", (email,)).fetchone()
+                removed += int(bool(row and row["active"]))
+                self.db.execute(
+                    "INSERT INTO mailing_subscribers(email,token,active,created_at,language,operator_excluded) "
+                    "VALUES(?,?,0,?,'ko',1) ON CONFLICT(email) DO UPDATE SET active=0,operator_excluded=1",
+                    (email, secrets.token_urlsafe(24), datetime.now(UTC).isoformat()),
+                )
+                self.db.execute(
+                    "UPDATE mailing_outbox SET status='suppressed' WHERE email=? AND status IN ('queued','failed')",
+                    (email,),
+                )
+        return removed
 
     def edit_subscriber(self, email: str, *, new_email: str | None = None, language: str | None = None) -> bool:
         email = normalize_email(email)
@@ -850,14 +893,15 @@ class _PostContent(HTMLParser):
 
 def build_email(*, sender: str, recipient: str, title: str, telegram_html: str,
                 invite_url: str, unsubscribe_url: str, message_id: str = "",
-                subscribe_url: str = "", language: str = "ko", preferences_url: str = "") -> EmailMessage:
+                subscribe_url: str = "", language: str = "ko", preferences_url: str = "",
+                one_click_unsubscribe: bool = False) -> EmailMessage:
     normalize_email(sender)
     recipient = normalize_email(recipient)
     content = _PostContent()
     content.feed(telegram_html)
     plain = "".join(content.plain)
     html = "".join(content.html)
-    copy = language_copy(language)
+    copy = language_copy(language, one_click_unsubscribe=one_click_unsubscribe)
     if invite_url:
         plain += f"\n\n{copy['invite']}: {invite_url}"
         html += f'<br><br><a href="{escape(invite_url, quote=True)}">{escape(copy["invite"])}</a>'
@@ -870,7 +914,10 @@ def build_email(*, sender: str, recipient: str, title: str, telegram_html: str,
         html += (f'<br><br><a href="{escape(preferences_url, quote=True)}">{escape(copy["preferences"])}</a>'
                  f'<br>{escape(copy["preferences_hint"])}')
     plain += f"\n\n{copy['unsubscribe']}: {unsubscribe_url}\n{copy['unsubscribe_hint']}"
-    html += (f'<br><br><a href="{escape(unsubscribe_url, quote=True)}">{escape(copy["unsubscribe"])}</a>'
+    button_style = (' style="display:inline-block;padding:10px 16px;border:1px solid #777;'
+                    'border-radius:6px;color:#222;text-decoration:none"' if one_click_unsubscribe else "")
+    html += (f'<br><br><a href="{escape(unsubscribe_url, quote=True)}"{button_style}>'
+             f'{escape(copy["unsubscribe"])}</a>'
              f'<br>{escape(copy["unsubscribe_hint"])}')
     message = EmailMessage()
     message["From"] = sender
@@ -879,8 +926,11 @@ def build_email(*, sender: str, recipient: str, title: str, telegram_html: str,
     message["Date"] = formatdate(localtime=False)
     if message_id:
         message["Message-ID"] = message_id
-    # A bot confirmation flow is not an RFC 8058 one-click unsubscribe endpoint.
     message["List-Unsubscribe"] = f"<{unsubscribe_url}>"
+    if one_click_unsubscribe:
+        if urlsplit(unsubscribe_url).scheme != "https":
+            raise ValueError("원클릭 수신 해지 링크는 HTTPS 주소여야 합니다.")
+        message["List-Unsubscribe-Post"] = "List-Unsubscribe=One-Click"
     message.set_content(plain)
     message.add_alternative(
         f'<!doctype html><html lang="{copy["html_lang"]}"><body style="font-family:sans-serif;line-height:1.7">'
@@ -1022,6 +1072,7 @@ def _deliver_pending(settings, store: MailingStore, *, bot_username: str, sender
     if not re.fullmatch(r"[A-Za-z0-9_]{5,32}", username):
         raise ValueError("수신 해지 링크에 사용할 텔레그램 봇 사용자명이 필요합니다.")
     settings.require_mail()
+    store.apply_exclusions(settings.mailing_exclusions_path)
     send = sender or SMTPMailer(settings).send
     report = DeliveryReport()
     pending = store.db.execute(
@@ -1055,7 +1106,9 @@ def _deliver_pending(settings, store: MailingStore, *, bot_username: str, sender
                     "AND status='queued'", delivery_ids,
                 )
             continue
-        unsubscribe_url = f"https://t.me/{username}?start=unsubscribe_{row['token']}"
+        one_click = bool(settings.mailing_unsubscribe_base_url)
+        unsubscribe_url = (f"{settings.mailing_unsubscribe_base_url.rstrip('/')}/unsubscribe/{row['token']}"
+                           if one_click else f"https://t.me/{username}?start=unsubscribe_{row['token']}")
         digest = hashlib.sha256(
             (row["email"] + "\0" + "\0".join(
                 f"{item['post_key']}:{item['id']}:{item['attempts'] + 1}" for item in rows
@@ -1076,10 +1129,20 @@ def _deliver_pending(settings, store: MailingStore, *, bot_username: str, sender
             unsubscribe_url=unsubscribe_url, message_id=message_id,
             subscribe_url=f"https://t.me/{username}?start=subscribe",
             language=language, preferences_url=f"https://t.me/{username}?start=language_{row['token']}",
+            one_click_unsubscribe=one_click,
         )
         if not store.claim_batch(delivery_ids, message_id, daily_limit=settings.mailing_daily_limit):
             if store.delivery_status(settings)["remaining_daily_messages"] == 0:
                 break
+            report.skipped += 1
+            continue
+        # A web unsubscribe can commit while translations/the batch claim run.
+        if not store.db.execute(
+            "SELECT 1 FROM mailing_subscribers s WHERE email=? AND active=1 "
+            "AND NOT EXISTS (SELECT 1 FROM mailing_delivery_blocks b WHERE b.email=s.email)",
+            (row["email"],),
+        ).fetchone():
+            store.finish_batch(delivery_ids, "suppressed")
             report.skipped += 1
             continue
         try:
