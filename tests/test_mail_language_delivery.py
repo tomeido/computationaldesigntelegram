@@ -315,10 +315,11 @@ def test_legacy_subscriber_schema_preserves_identity_status_dates_and_korean_def
             columns = [row[1] for row in store.db.execute("PRAGMA table_info(mailing_subscribers)")]
             assert columns[:5] == ["email", "token", "telegram_user_id", "active", "created_at"]
             assert columns.count("language") == 1
+            assert columns.count("operator_excluded") == 1
             rows = {row["email"]: dict(row) for row in store.db.execute("SELECT * FROM mailing_subscribers")}
             assert rows["active@example.com"] == {
                 "email": "active@example.com", "token": "active-token", "telegram_user_id": 11,
-                "active": 1, "created_at": created_at, "language": "ko",
+                "active": 1, "created_at": created_at, "language": "ko", "operator_excluded": 0,
             }
             assert rows["inactive@example.com"]["active"] == 0
             assert rows["inactive@example.com"]["language"] == "ko"

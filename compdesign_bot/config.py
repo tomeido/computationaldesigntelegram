@@ -49,6 +49,10 @@ class Settings:
     telegram_invite_url: str = ""
     mailing_enabled: bool = False
     mailing_xlsx_path: Path | None = None
+    mailing_exclusions_path: Path = Path("data/mailing/exclusions.json")
+    mailing_unsubscribe_base_url: str = ""
+    mailing_unsubscribe_host: str = "127.0.0.1"
+    mailing_unsubscribe_port: int = 8085
     mailing_batch_limit: int = 200
     mailing_daily_limit: int = 400
     mailing_bounce_enabled: bool = False
@@ -74,6 +78,21 @@ class Settings:
             raise ValueError("SMTP_PORT: 1~65535 범위로 입력하세요.")
         if not 1 <= self.imap_port <= 65535:
             raise ValueError("IMAP_PORT: 1~65535 범위로 입력하세요.")
+        if type(self.mailing_unsubscribe_port) is not int or not 1 <= self.mailing_unsubscribe_port <= 65535:
+            raise ValueError("MAILING_UNSUBSCRIBE_PORT: 1~65535 범위로 입력하세요.")
+        if self.mailing_unsubscribe_base_url:
+            try:
+                url = urlsplit(self.mailing_unsubscribe_base_url)
+                if (url.scheme != "https" or not url.hostname or url.username is not None or url.password is not None
+                        or url.query or url.fragment or url.port == 0
+                        or not self.mailing_unsubscribe_base_url.isascii()
+                        or not re.fullmatch(r"(?:/[A-Za-z0-9._~-]+)*/?", url.path)
+                        or any(c in "?#" for c in self.mailing_unsubscribe_base_url)
+                        or any(c.isspace() or ord(c) < 32 or c in '<>"\\' for c in self.mailing_unsubscribe_base_url)
+                        or any(p in {".", ".."} for p in url.path.split("/"))):
+                    raise ValueError
+            except ValueError:
+                raise ValueError("MAILING_UNSUBSCRIBE_BASE_URL: 영문 경로의 공개 HTTPS 주소를 입력하세요.") from None
         if self.bot_username and not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{4,31}", self.bot_username):
             raise ValueError("TELEGRAM_BOT_USERNAME: @를 제외한 봇 사용자명을 입력하세요.")
         if self.telegram_invite_url:
@@ -138,6 +157,10 @@ class Settings:
                 Path(os.environ["MAILING_XLSX_PATH"].strip())
                 if os.getenv("MAILING_XLSX_PATH", "").strip() else None
             ),
+            mailing_exclusions_path=Path(os.getenv("MAILING_EXCLUSIONS_PATH", "data/mailing/exclusions.json")),
+            mailing_unsubscribe_base_url=os.getenv("MAILING_UNSUBSCRIBE_BASE_URL", "").strip().rstrip("/"),
+            mailing_unsubscribe_host=os.getenv("MAILING_UNSUBSCRIBE_HOST", "127.0.0.1").strip(),
+            mailing_unsubscribe_port=_integer("MAILING_UNSUBSCRIBE_PORT", 8085, 1, 65535),
             mailing_batch_limit=_integer("MAILING_BATCH_LIMIT", 200, 1, 1000),
             mailing_daily_limit=_integer("MAILING_DAILY_LIMIT", 400, 1, 10000),
             mailing_bounce_enabled=_boolean("MAILING_BOUNCE_ENABLED"),

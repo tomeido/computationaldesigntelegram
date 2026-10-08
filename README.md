@@ -243,6 +243,60 @@ python -m compdesign_bot mail-edit new@example.com --language en
 python -m compdesign_bot mail-remove new@example.com
 ```
 
+### 웹에서 한 번에 메일 수신 해지
+
+공개 HTTPS 주소를 설정하면 메일 하단의 **메일 수신 해지** 버튼을 한 번 누르는 것만으로
+해지됩니다. Telegram 계정·로그인·추가 명령은 필요하지 않습니다. 주소별 무작위 토큰만 링크에
+넣으며 이메일 주소는 URL이나 완료 화면에 노출하지 않습니다. 같은 링크를 다시 눌러도 안전합니다.
+해지 시 대기·실패 메일을 취소하고 해지 기록을 보존하므로 엑셀 재가져오기로 복구되지 않습니다.
+이미 SMTP에 전송 중이거나 접수된 메일은 회수할 수 없습니다.
+
+`.env`에 운영 중인 HTTPS 프록시의 공개 주소와 내부 처리기 포트를 설정하세요.
+
+```dotenv
+MAILING_UNSUBSCRIBE_BASE_URL=https://briefing.example.com
+MAILING_UNSUBSCRIBE_HOST=127.0.0.1
+MAILING_UNSUBSCRIBE_PORT=8085
+MAILING_EXCLUSIONS_PATH=data/mailing/exclusions.json
+```
+
+기존 HTTPS 프록시에서 `/unsubscribe/` 경로만 내부 `127.0.0.1:8085`로 연결합니다.
+공개 주소에 `/mail` 같은 경로가 있으면 `/mail/unsubscribe/`를 그대로 전달하세요.
+이 경로에는 로그인·Access 화면이나 리다이렉트를 추가하지 않습니다. 기존 봇 관리 기능의 인증은 유지합니다.
+링크에는 관리 토큰이 있으므로 프록시에서도 이 경로의 전체 URL을 기록하지 마세요.
+`run`과 `listen`은 설정된 경우 처리기를 함께 시작하고 종료 시 닫습니다.
+
+Docker에서는 다음 선택적 구성으로 호스트의 루프백 포트만 연결합니다. 기존 데이터 볼륨은 유지합니다.
+
+```bash
+docker compose -f compose.yaml -f compose.unsubscribe.yaml up -d --build --force-recreate bot
+```
+
+메일 본문 버튼과 함께 `List-Unsubscribe` 및 `List-Unsubscribe-Post` 헤더도 제공합니다.
+메일 앱은 이 링크에 `List-Unsubscribe=One-Click` POST 요청을 보내 해지할 수 있습니다.
+발송 제공업체가 두 헤더를 DKIM 서명에 포함해야 하며, Gmail의 기본 수신 거부 버튼 표시는
+발신자 자격과 메일 앱 정책에도 달려 있습니다. 본문 버튼은 별도로 사용할 수 있습니다.
+자세한 조건은 [RFC 8058](https://www.rfc-editor.org/rfc/rfc8058.html)과
+[Gmail 발신자 안내](https://support.google.com/mail/answer/14229414?hl=en)를 참고하세요.
+GET은 본문 버튼을 한 번 눌렀을 때 즉시 해지하며, HEAD는 구독을 바꾸지 않습니다.
+따라서 링크를 GET으로 방문하는 보안 검사기도 해지를 실행할 수 있습니다.
+공개 HTTPS 주소를 비워 두면 기존 Telegram 해지 링크를 유지합니다.
+
+항의·수신 거부 주소는 `data/mailing/exclusions.json`에 이메일 문자열의 JSON 배열로 보관하세요.
+이 파일은 Git과 Docker 이미지에서 제외되며 개인정보이므로 권한을 `600`으로 설정합니다.
+Docker에서는 기존 `bot-data` 볼륨의 `/app/data/mailing/exclusions.json`에 넣어야 합니다.
+목록 전체를 검증한 뒤 한 트랜잭션으로 적용하며, 잘못된 파일은 메일 발송을 보류합니다.
+시작·엑셀 가져오기·발송 전에 적용하고, 새 주소의 재등록도 막습니다.
+
+```bash
+chmod 600 data/mailing/exclusions.json
+python -m compdesign_bot mail-apply-exclusions  # 제외만 적용, 메일 발송 없음
+python -m compdesign_bot mail-status
+```
+
+원클릭 기능을 운영에 반영한 뒤 테스트 주소를 등록해 링크가 같은 운영 DB에 반영되는지 확인하세요.
+GitHub 코드 수정만으로 운영 데이터나 HTTPS 경로가 자동 변경되지는 않습니다.
+
 Gmail을 쓰는 경우 반송 확인을 켜세요. SMTP와 같은 계정·앱 비밀번호로 Gmail IMAP에 연결합니다.
 
 ```dotenv
