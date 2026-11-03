@@ -6,6 +6,7 @@ import sqlite3
 
 from .config import Settings
 from .mail_bounce_sync import BounceSyncUnavailable, sync_mail_bounces
+from .mail_unsubscribe_sync import UnsubscribeSyncUnavailable, sync_mail_unsubscribes
 from .mailing import MailingStore, deliver_pending
 from .storage import Store, job_lock
 
@@ -43,6 +44,11 @@ def send_mail_queue(settings: Settings):
     with job_lock(settings.database_path.with_suffix(".mail.sqlite3")):
         mail = MailingStore(settings.database_path)
         try:
+            if settings.mailing_unsubscribe_enabled:
+                with job_lock(settings.database_path.with_suffix(".unsubscribe.sqlite3"), wait=True):
+                    unsubscribes = sync_mail_unsubscribes(settings, mail)
+                if unsubscribes.backlog:
+                    raise UnsubscribeSyncUnavailable("해지 요청 확인이 남아 있어 메일 발송을 보류합니다.")
             if settings.mailing_bounce_enabled:
                 bounces = sync_mail_bounces(settings, mail)
                 if bounces.backlog or bounces.untrusted:
@@ -52,6 +58,34 @@ def send_mail_queue(settings: Settings):
             return deliver_pending(settings, mail, bot_username=settings.bot_username)
         finally:
             mail.close()
+
+
+def sync_unsubscribe_requests(settings: Settings):
+    """Process opt-outs without publishing or sending any messages."""
+    settings.require_unsubscribes()
+    with (
+        job_lock(settings.database_path.with_suffix(".unsubscribe.sqlite3"), wait=True),
+        MailingStore(settings.database_path) as mail,
+    ):
+        return sync_mail_unsubscribes(settings, mail)
+
+
+async def watch_unsubscribe_requests(settings: Settings):
+    """Poll independently of the publication schedule, including at startup."""
+    if not settings.mailing_unsubscribe_enabled:
+        return
+    log.info("이메일 답장 자동 해지 확인을 시작했습니다. 확인 간격: 60초")
+    while True:
+        try:
+            report = await asyncio.to_thread(sync_unsubscribe_requests, settings)
+            if report.applied or report.backlog:
+                log.info("답장 자동 해지 %s명 / 추가 확인 필요 %s", report.applied, report.backlog)
+            if report.oversized:
+                log.warning("본문을 완전히 확인할 수 없는 대용량 답장 %s건을 건너뛰었습니다.", report.oversized)
+        except (OSError, RuntimeError, ValueError, sqlite3.Error):
+            # Credentials, addresses and server text must never appear in logs.
+            log.warning("해지 요청 확인을 완료하지 못했습니다. 다음 확인 주기에 다시 시도합니다.")
+        await asyncio.sleep(60)
 
 
 async def auto_send_mail(settings: Settings):

@@ -19,7 +19,13 @@ from xml.etree import ElementTree as ET
 from zipfile import BadZipFile, ZipFile
 
 from .errors import SummaryError
-from .mail_localization import MailLocalizationUnavailable, MailLocalizer, language_copy, normalize_language
+from .mail_localization import (
+    MailLocalizationUnavailable,
+    MailLocalizer,
+    language_copy,
+    normalize_language,
+    reply_unsubscribe_hint,
+)
 
 _XML = {"s": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
 _REL = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
@@ -241,6 +247,15 @@ class MailingStore:
                 UNIQUE(message_id,email,action,status)
             );
             CREATE TABLE IF NOT EXISTS mailing_bounce_cursors (
+                mailbox_key TEXT PRIMARY KEY, uidvalidity TEXT NOT NULL,
+                last_uid INTEGER NOT NULL, updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS mailing_unsubscribe_events (
+                id INTEGER PRIMARY KEY, message_id TEXT NOT NULL, email TEXT NOT NULL,
+                referenced_message_id TEXT NOT NULL, applied INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL, UNIQUE(message_id,email)
+            );
+            CREATE TABLE IF NOT EXISTS mailing_unsubscribe_cursors (
                 mailbox_key TEXT PRIMARY KEY, uidvalidity TEXT NOT NULL,
                 last_uid INTEGER NOT NULL, updated_at TEXT NOT NULL
             );
@@ -553,6 +568,76 @@ class MailingStore:
     def outbox_counts(self) -> dict[str, int]:
         return dict(self.db.execute("SELECT status,COUNT(*) FROM mailing_outbox GROUP BY status"))
 
+    def _unsubscribe_delivery(self, request):
+        if not request.references:
+            return None
+        placeholders = ",".join("?" for _ in request.references)
+        return self.db.execute(
+            "SELECT o.batch_message_id,o.attempted_at,s.active,s.created_at "
+            "FROM mailing_outbox o JOIN mailing_subscribers s ON s.email=o.email "
+            f"WHERE o.email=? AND o.batch_message_id IN ({placeholders}) "
+            "AND o.attempted_at IS NOT NULL ORDER BY julianday(o.attempted_at) DESC LIMIT 1",
+            (normalize_email(request.email), *request.references),
+        ).fetchone()
+
+    def unsubscribe_reply_matches(self, request) -> bool:
+        """Limit body reads to an exact member replying to an attempted delivery.
+
+        Old memberships remain candidates for auditing; only the atomic apply
+        step can decide whether the current membership may be deactivated.
+        """
+        return self._unsubscribe_delivery(request) is not None
+
+    def apply_unsubscribe_reply(self, request) -> str:
+        """Apply a verified reply once without changing delivery history or budgets."""
+        email = normalize_email(request.email)
+        with self.db:
+            self.db.execute("BEGIN IMMEDIATE")
+            if self.db.execute(
+                "SELECT 1 FROM mailing_unsubscribe_events WHERE message_id=? AND email=?",
+                (request.message_id, email),
+            ).fetchone():
+                return "duplicate"
+            delivery = self._unsubscribe_delivery(request)
+            if delivery is None:
+                return "unmatched"
+            self.db.execute(
+                "INSERT INTO mailing_unsubscribe_events"
+                "(message_id,email,referenced_message_id,created_at) VALUES(?,?,?,?)",
+                (request.message_id, email, delivery["batch_message_id"], datetime.now(UTC).isoformat()),
+            )
+            if not delivery["active"] or (
+                datetime.fromisoformat(delivery["created_at"]) > datetime.fromisoformat(delivery["attempted_at"])
+            ):
+                return "stale"
+            self.db.execute("UPDATE mailing_subscribers SET active=0 WHERE email=?", (email,))
+            self.db.execute(
+                "UPDATE mailing_outbox SET status='suppressed',error='reply_unsubscribed' "
+                "WHERE email=? AND status IN ('queued','failed')", (email,),
+            )
+            self.db.execute(
+                "UPDATE mailing_unsubscribe_events SET applied=1 WHERE message_id=? AND email=?",
+                (request.message_id, email),
+            )
+        return "applied"
+
+    def unsubscribe_cursor(self, mailbox_key: str) -> tuple[str, int] | None:
+        row = self.db.execute(
+            "SELECT uidvalidity,last_uid FROM mailing_unsubscribe_cursors WHERE mailbox_key=?", (mailbox_key,),
+        ).fetchone()
+        return (row[0], row[1]) if row else None
+
+    def save_unsubscribe_cursor(self, mailbox_key: str, uidvalidity: str, last_uid: int) -> None:
+        with self.db:
+            self.db.execute(
+                "INSERT INTO mailing_unsubscribe_cursors VALUES(?,?,?,?) ON CONFLICT(mailbox_key) DO UPDATE "
+                "SET uidvalidity=excluded.uidvalidity,last_uid=CASE "
+                "WHEN mailing_unsubscribe_cursors.uidvalidity=excluded.uidvalidity "
+                "THEN MAX(mailing_unsubscribe_cursors.last_uid,excluded.last_uid) ELSE excluded.last_uid END,"
+                "updated_at=excluded.updated_at",
+                (mailbox_key, uidvalidity, last_uid, datetime.now(UTC).isoformat()),
+            )
+
     def bounce_matches(self, notice) -> bool:
         return bool(self.db.execute(
             "SELECT 1 FROM mailing_outbox WHERE batch_message_id=? AND email=? "
@@ -850,7 +935,8 @@ class _PostContent(HTMLParser):
 
 def build_email(*, sender: str, recipient: str, title: str, telegram_html: str,
                 invite_url: str, unsubscribe_url: str, message_id: str = "",
-                subscribe_url: str = "", language: str = "ko", preferences_url: str = "") -> EmailMessage:
+                subscribe_url: str = "", language: str = "ko", preferences_url: str = "",
+                reply_unsubscribe_enabled: bool = False) -> EmailMessage:
     normalize_email(sender)
     recipient = normalize_email(recipient)
     content = _PostContent()
@@ -872,9 +958,15 @@ def build_email(*, sender: str, recipient: str, title: str, telegram_html: str,
     plain += f"\n\n{copy['unsubscribe']}: {unsubscribe_url}\n{copy['unsubscribe_hint']}"
     html += (f'<br><br><a href="{escape(unsubscribe_url, quote=True)}">{escape(copy["unsubscribe"])}</a>'
              f'<br>{escape(copy["unsubscribe_hint"])}')
+    if reply_unsubscribe_enabled:
+        hint = reply_unsubscribe_hint(language)
+        plain += f"\n{hint}"
+        html += f"<br>{escape(hint)}"
     message = EmailMessage()
     message["From"] = sender
     message["To"] = recipient
+    if reply_unsubscribe_enabled:
+        message["Reply-To"] = sender
     message["Subject"] = " ".join(title.splitlines())[:200]
     message["Date"] = formatdate(localtime=False)
     if message_id:
@@ -1076,6 +1168,7 @@ def _deliver_pending(settings, store: MailingStore, *, bot_username: str, sender
             unsubscribe_url=unsubscribe_url, message_id=message_id,
             subscribe_url=f"https://t.me/{username}?start=subscribe",
             language=language, preferences_url=f"https://t.me/{username}?start=language_{row['token']}",
+            reply_unsubscribe_enabled=settings.mailing_unsubscribe_enabled,
         )
         if not store.claim_batch(delivery_ids, message_id, daily_limit=settings.mailing_daily_limit):
             if store.delivery_status(settings)["remaining_daily_messages"] == 0:

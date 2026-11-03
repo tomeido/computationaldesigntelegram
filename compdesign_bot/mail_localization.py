@@ -211,6 +211,22 @@ def language_copy(code: str) -> dict[str, str]:
     return {"html_lang": code, **dict(zip(_COPY_KEYS, _COPY[code], strict=True))}
 
 
+def reply_unsubscribe_hint(code: str) -> str:
+    """Offer the same unambiguous reply command in each supported language."""
+    hints = {
+        "ko": "텔레그램 없이 해지하려면 이 메일에 STOP 또는 구독 해지라고 답장하세요. 자동으로 처리됩니다.",
+        "en": "To unsubscribe without Telegram, reply to this email with STOP. Your request is processed automatically.",
+        "ja": "Telegramを使わずに配信を停止するには、このメールに STOP と返信してください。自動で処理されます。",
+        "zh": "无需Telegram，回复此邮件并写下 STOP 即可自动取消订阅。",
+        "de": "Antworten Sie auf diese E-Mail mit STOP, um sich ohne Telegram automatisch abzumelden.",
+        "fr": "Pour vous désabonner automatiquement sans Telegram, répondez à cet e-mail avec STOP.",
+        "es": "Para cancelar la suscripción automáticamente sin Telegram, responde a este correo con STOP.",
+        "pt": "Para cancelar a assinatura automaticamente sem Telegram, responda a este e-mail com STOP.",
+    }
+    code = normalize_language(code)
+    return f"{hints['ko']} / {hints['en']}" if code == "bilingual" else hints[code]
+
+
 class _HTMLSlots(HTMLParser):
     """Keep markup/URLs locally; the provider receives only mutable text slots."""
 

@@ -35,6 +35,8 @@ class Settings:
     translation_provider: str = "local"
     gemini_api_key: str = field(default="", repr=False)
     gemini_model: str = DEFAULT_GEMINI_MODEL
+    superfan_enabled: bool = False
+    superfan_cooldown_seconds: int = 10
     local_model_path: Path = Path("data/models/m2m100")
     channel_name: str = "컴퓨트 디자인 브리핑 | Web3 · AI"
     timezone: str = "Asia/Seoul"
@@ -52,6 +54,7 @@ class Settings:
     mailing_batch_limit: int = 200
     mailing_daily_limit: int = 400
     mailing_bounce_enabled: bool = False
+    mailing_unsubscribe_enabled: bool = False
     imap_host: str = ""
     imap_port: int = 993
     smtp_host: str = ""
@@ -65,6 +68,7 @@ class Settings:
         for name, value, upper in (
             ("MAILING_BATCH_LIMIT", self.mailing_batch_limit, 1000),
             ("MAILING_DAILY_LIMIT", self.mailing_daily_limit, 10000),
+            ("SUPERFAN_COOLDOWN_SECONDS", self.superfan_cooldown_seconds, 3600),
         ):
             if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= upper:
                 raise ValueError(f"{name}: 1~{upper} 범위의 정수를 입력하세요.")
@@ -117,6 +121,8 @@ class Settings:
             translation_provider=os.getenv("TRANSLATION_PROVIDER", "local").strip().lower(),
             gemini_api_key=os.getenv("GEMINI_API_KEY", "").strip(),
             gemini_model=os.getenv("GEMINI_MODEL", cls.gemini_model).strip(),
+            superfan_enabled=_boolean("SUPERFAN_ENABLED"),
+            superfan_cooldown_seconds=_integer("SUPERFAN_COOLDOWN_SECONDS", 10, 1, 3600),
             local_model_path=Path(os.getenv("LOCAL_MODEL_PATH", "data/models/m2m100")),
             channel_name=os.getenv("CHANNEL_NAME", cls.channel_name).strip()[:100],
             timezone=timezone,
@@ -141,6 +147,7 @@ class Settings:
             mailing_batch_limit=_integer("MAILING_BATCH_LIMIT", 200, 1, 1000),
             mailing_daily_limit=_integer("MAILING_DAILY_LIMIT", 400, 1, 10000),
             mailing_bounce_enabled=_boolean("MAILING_BOUNCE_ENABLED"),
+            mailing_unsubscribe_enabled=_boolean("MAILING_UNSUBSCRIBE_ENABLED"),
             imap_host=os.getenv("IMAP_HOST", "").strip().lower(),
             imap_port=_integer("IMAP_PORT", 993, 1, 65535),
             smtp_host=os.getenv("SMTP_HOST", "").strip(),
@@ -174,6 +181,15 @@ class Settings:
             raise ValueError("반송 확인에는 MAILING_BOUNCE_ENABLED=true 설정이 필요합니다.")
         if self.imap_host != "imap.gmail.com" or not self.smtp_username or not self.smtp_password:
             raise ValueError("자동 반송 확인에는 Gmail IMAP 주소와 SMTP 계정 인증정보가 필요합니다.")
+
+    def require_unsubscribes(self) -> None:
+        from .mailing import normalize_email
+
+        if not self.mailing_unsubscribe_enabled:
+            raise ValueError("답장 자동 해지에는 MAILING_UNSUBSCRIBE_ENABLED=true 설정이 필요합니다.")
+        if self.imap_host != "imap.gmail.com" or not self.smtp_username or not self.smtp_password:
+            raise ValueError("답장 자동 해지에는 Gmail IMAP 주소와 SMTP 계정 인증정보가 필요합니다.")
+        normalize_email(self.smtp_from)
 
     def require_token(self) -> None:
         if not self.bot_token:

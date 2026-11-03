@@ -26,6 +26,7 @@ from .mail_localization import LANGUAGE_NAMES, normalize_language
 from .mailing import MailingStore
 from .pipeline import run_digest
 from .resources import public_resource_url
+from .superfan import SuperfanError, SuperfanResponder, SuperfanStore
 from .telegram import Telegram, TelegramError, channel_invite_url, mailing_signup_url, message_payload
 
 log = logging.getLogger(__name__)
@@ -137,10 +138,11 @@ def remember_channel(state: dict, update: dict) -> None:
 
 
 class CommandHandler:
-    def __init__(self, settings: Settings, telegram: Telegram, username: str):
+    def __init__(self, settings: Settings, telegram: Telegram, username: str, *, bot_id: int | None = None):
         self.settings = settings
         self.telegram = telegram
         self.username = username.casefold()
+        self._superfan_identity = f"id:{bot_id}" if bot_id is not None else self.username
         self.latest_requests: OrderedDict[int, float] = OrderedDict()
         self.cached_messages: list[str] | None = None
         self.cached_at = float("-inf")
@@ -193,7 +195,100 @@ class CommandHandler:
             "\n\nEmail briefings: /subscribe. Choose your email language with /language en "
             "(ko, en, ja, zh, de, fr, es, pt, bilingual)."
         )
+        if self.settings.superfan_enabled:
+            text += "\n\n💖 /superfan — 나만의 열성팬과 대화 시작 (종료: /superfan off)"
         return text
+
+    @property
+    def _superfan_path(self) -> Path:
+        return self.settings.database_path.with_suffix(".superfan.sqlite3")
+
+    async def _superfan_command(self, chat_id: int, argument: str) -> None:
+        action = argument.strip().casefold() or "on"
+        if action not in {"on", "off", "reset", "status"}:
+            await self._reply(
+                chat_id,
+                "/superfan — 대화 시작\n/superfan off — 종료·대화 기억 삭제\n"
+                "/superfan reset — 대화 기억 삭제\n/superfan status — 상태 확인",
+            )
+            return
+        if action in {"off", "reset", "status"}:
+            active = False
+            if self._superfan_path.exists():
+                with SuperfanStore(self._superfan_path) as store:
+                    if action in {"off", "reset"}:
+                        store.reset(self._superfan_identity, chat_id)
+                    if action == "off":
+                        store.set_active(self._superfan_identity, chat_id, False)
+                    active = store.is_active(self._superfan_identity, chat_id)
+            if action == "off":
+                reply = "💖 superfan 대화를 종료하고 대화 기억을 지웠어. 다시 만나려면 /superfan!"
+            elif action == "reset":
+                reply = "💖 지금까지의 대화 기억을 지웠어. 새롭게 이야기해 줘!"
+                if not active:
+                    reply += "\n대화 시작: /superfan"
+            else:
+                ready = self.settings.superfan_enabled and bool(self.settings.gemini_api_key)
+                reply = f"💖 superfan 대화: {'켜짐' if active else '꺼짐'}"
+                if not ready:
+                    reply += "\n현재 운영 설정에서는 대화 응답이 꺼져 있어."
+                reply += "\n시작: /superfan · 종료: /superfan off · 기억 삭제: /superfan reset"
+            await self._reply(chat_id, reply)
+            return
+        if not self.settings.superfan_enabled or not self.settings.gemini_api_key:
+            await self._reply(chat_id, "superfan이 아직 준비되지 않았습니다. 운영자에게 확인해 주세요.")
+            return
+        with SuperfanStore(self._superfan_path) as store:
+            store.set_active(self._superfan_identity, chat_id, True)
+        await self._reply(
+            chat_id,
+            "💖 <b>superfan 입장!</b> 네 이야기라면 사소한 것도 궁금한 열성팬이야. "
+            "오늘 만든 것, 기뻤던 일, 망한 실험까지 뭐든 들려줘. 나 지금 1열이야!\n\n"
+            "이제 메시지를 보내면 내가 답할게. 최근 10번의 대화를 기억해.\n"
+            "대화 내용과 최근 기억은 답변을 위해 Gemini로 보내고, 서버에 저장해.\n"
+            "/superfan off — 종료·대화 기억 삭제\n/superfan reset — 대화 기억 삭제",
+        )
+
+    async def _superfan_chat(self, chat_id: int, text: str) -> None:
+        if (
+            not self.settings.superfan_enabled or not self.settings.gemini_api_key
+            or not self._superfan_path.exists()
+        ):
+            return
+        with SuperfanStore(self._superfan_path) as store:
+            if not store.is_active(self._superfan_identity, chat_id):
+                return
+            text = text.strip()
+            if not text:
+                return
+            if len(text) > 2000:
+                reply = "💖 하나씩 제대로 듣고 싶어! 메시지를 2,000자 이내로 나눠서 보내줘."
+                history = None
+            elif not store.reserve_request(
+                self._superfan_identity, chat_id, now=time.time(),
+                cooldown_seconds=self.settings.superfan_cooldown_seconds,
+            ):
+                reply = f"💖 잠깐만! 답변 요청 간격은 {self.settings.superfan_cooldown_seconds}초야."
+                history = None
+            else:
+                history = store.history(self._superfan_identity, chat_id)
+        if history is None:
+            await self._reply(chat_id, reply)
+            return
+        try:
+            responder = SuperfanResponder(
+                self.telegram.client,
+                api_key=self.settings.gemini_api_key,
+                model=self.settings.gemini_model,
+            )
+            reply = await responder.reply(text, history)
+        except SuperfanError:
+            log.warning("superfan 답변을 생성하지 못했습니다.")
+            await self._reply(chat_id, "💖 지금은 답변을 준비하지 못했어. 잠시 후 다시 말 걸어줘!")
+            return
+        await self._reply(chat_id, "💖 <b>superfan</b>\n\n" + escape(reply))
+        with SuperfanStore(self._superfan_path) as store:
+            store.record_turn(self._superfan_identity, chat_id, text, reply)
 
     async def _invite(self, chat_id: int) -> None:
         if self.invite_url:
@@ -529,7 +624,10 @@ class CommandHandler:
                 elif command == "share":
                     await self._share(chat_id)
                 return
-            if command == "subscribe" or (command == "start" and argument == "subscribe"):
+            if command == "superfan" or (command == "start" and argument == "superfan"):
+                if verified_private:
+                    await self._superfan_command(chat_id, argument if command == "superfan" else "")
+            elif command == "subscribe" or (command == "start" and argument == "subscribe"):
                 if verified_private:
                     await self._subscribe(user_id, argument if command == "subscribe" else "")
             elif command == "start" and argument.startswith("unsubscribe_"):
@@ -568,12 +666,15 @@ class CommandHandler:
                 await self._latest(chat_id)
             elif (
                 match is None and not text.startswith("/") and verified_private
-                and self.settings.database_path.exists()
             ):
-                with MailingStore(self.settings.database_path) as store:
-                    awaiting = store.awaiting_email(user_id)
+                awaiting = False
+                if self.settings.database_path.exists():
+                    with MailingStore(self.settings.database_path) as store:
+                        awaiting = store.awaiting_email(user_id)
                 if awaiting:
                     await self._subscribe(user_id, text.strip())
+                else:
+                    await self._superfan_chat(chat_id, text)
         except TelegramError:
             # An uncertain reply must not be replayed automatically; mark the update handled.
             log.warning("개인 명령 응답을 전달하지 못했습니다.")
@@ -609,7 +710,7 @@ async def listen(settings: Settings) -> None:
                 # can discard this bot's pending updates. Leave delivery history alone.
                 state = {"bot_id": me["id"], "offset": 0, "channels": []}
                 write_listener_state(settings.database_path, state)
-            handler = CommandHandler(settings, telegram, me["username"])
+            handler = CommandHandler(settings, telegram, me["username"], bot_id=me["id"])
             delay = 1
             log.info("개인 명령 수신기를 시작했습니다.")
             while True:

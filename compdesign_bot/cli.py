@@ -166,6 +166,9 @@ async def configure_bot(settings: Settings):
             ("help", "이용 안내와 채널 연결 방법"),
         )
     ]
+    if settings.superfan_enabled:
+        commands.insert(1, {"command": "superfan", "description": "나만의 열성팬과 대화 시작"})
+        description += "\n/superfan 나만의 열성팬과 대화"
     async with httpx.AsyncClient() as client:
         bot = Telegram(client, settings.bot_token, settings.channel_id)
         me = await bot.call("getMe")
@@ -219,9 +222,16 @@ async def discover_channel(settings: Settings):
 
 async def dispatch(args, settings: Settings):
     if args.command in {"mail-import", "mail-status", "mail-send", "resolve-mail-delivery", "mail-prospects-import",
-                        "mail-edit", "mail-remove", "mail-sync-bounces", "mail-resume"}:
+                        "mail-edit", "mail-remove", "mail-sync-bounces", "mail-sync-unsubscribes", "mail-resume"}:
         from .mail_delivery import send_mail_queue, sync_mail_queue
         from .mailing import MailingStore
+
+        if args.command == "mail-sync-unsubscribes":
+            from .mail_delivery import sync_unsubscribe_requests
+
+            report = await asyncio.to_thread(sync_unsubscribe_requests, settings)
+            print(json.dumps(asdict(report), ensure_ascii=False, indent=2))
+            return
 
         if args.command == "mail-sync-bounces":
             from .mail_bounce_sync import sync_mail_bounces
@@ -306,17 +316,21 @@ async def dispatch(args, settings: Settings):
         print(f"채널 이름·소개 설정 완료: {settings.channel_name}")
     elif args.command in ("run", "listen"):
         from .bot_runtime import listen
+        from .mail_delivery import watch_unsubscribe_requests
 
         settings.require_token()
         if settings.mailing_xlsx_path:
             from .mail_delivery import sync_mail_queue
 
             await asyncio.to_thread(sync_mail_queue, settings)
+        workers = [listen(settings)]
+        if settings.mailing_unsubscribe_enabled:
+            workers.append(watch_unsubscribe_requests(settings))
         if args.command == "run" and settings.channel_id:
-            await asyncio.gather(listen(settings), serve(settings))
+            workers.append(serve(settings))
         else:
             print("봇 개인 대화 응답을 시작합니다. 채널 발행은 채널 연결 후 활성화됩니다.", flush=True)
-            await listen(settings)
+        await asyncio.gather(*workers)
     elif args.command in ("preview", "publish"):
         result = await run_digest(settings, publish=args.command == "publish")
         if args.command == "preview":
@@ -382,6 +396,7 @@ def main():
     sub.add_parser("mail-status", help="메일 구독자 수와 발송 대기·실패 기록 확인")
     sub.add_parser("mail-send", help="대기 중인 브리핑 메일 발송 (텔레그램 재발행 없음)")
     sub.add_parser("mail-sync-bounces", help="Gmail 반송 확인 및 무효 주소 제외·발송 보류 (메일 발송 없음)")
+    sub.add_parser("mail-sync-unsubscribes", help="Gmail 답장 수신 해지 확인·처리 (메일 발송 없음)")
     p = sub.add_parser("mail-resume", help="원인 해결 후 주소별 반송 보류 해제 (기존 메일 재발송 없음)")
     p.add_argument("email", help="발송을 재개할 보류 주소")
     p = sub.add_parser("mail-edit", help="활성 구독자의 이메일·수신 언어 수정")

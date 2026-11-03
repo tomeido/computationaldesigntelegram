@@ -124,8 +124,12 @@ def _search(client, since: str, cursor: int) -> list[int]:
     return sorted(uids)
 
 
-def _fetch(client, uids: list[int], *, headers: bool) -> dict[int, bytes]:
-    query = "(UID BODY.PEEK[HEADER.FIELDS (CONTENT-TYPE AUTHENTICATION-RESULTS)])" if headers else "(UID BODY.PEEK[])"
+def _fetch(client, uids: list[int], *, headers: bool,
+           header_fields: tuple[str, ...] | None = None) -> dict[int, bytes]:
+    fields = header_fields or ("CONTENT-TYPE", "AUTHENTICATION-RESULTS")
+    if any(not re.fullmatch(r"[A-Z0-9-]+", field) for field in fields):
+        raise ValueError("invalid header field")
+    query = f"(UID BODY.PEEK[HEADER.FIELDS ({' '.join(fields)})])" if headers else "(UID BODY.PEEK[])"
     data = _ok(client.uid("FETCH", ",".join(str(uid) for uid in uids), query))
     found = {}
     for item in data:

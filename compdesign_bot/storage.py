@@ -137,14 +137,14 @@ class Store:
 
 
 @contextmanager
-def job_lock(path: Path):
+def job_lock(path: Path, *, wait: bool = False):
     # The deployment target is Linux. The lock also serializes manual publish with scheduled runs.
     import fcntl
 
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.with_suffix(".lock").open("a") as handle:
         try:
-            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(handle, fcntl.LOCK_EX | (0 if wait else fcntl.LOCK_NB))
         except BlockingIOError:
             raise RuntimeError("다른 작업이 실행 중입니다. 완료 후 다시 실행하세요.") from None
         try:
